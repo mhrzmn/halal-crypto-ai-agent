@@ -1,0 +1,147 @@
+"""
+Antigravity Direct AI Trader.
+Runs an autonomous AI analysis cycle and directly places trades with ZERO user intervention.
+"""
+
+import sys
+import json
+from datetime import datetime
+
+from ai_commander import AICommander
+from storage.database import Database
+
+def run_ai_trading_turn():
+    commander = AICommander()
+    db = Database()
+    data = commander.get_market_overview()
+
+    print("=" * 70)
+    print("       ANTIGRAVITY AUTONOMOUS AI TRADING CYCLE (DIRECT EXECUTION)")
+    print(f"       Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} | Zero Intervention Mode")
+    print("=" * 70)
+
+    cash = data["cash_balance_usdt"]
+    positions = data["open_positions"]
+    pairs = data["pairs"]
+
+    print(f"[*] Available Cash: ${cash:,.2f} USDT | Open Positions: {len(positions)}")
+
+    # 1. Manage any active open positions first (Trailing stops / profit exits)
+    for pos in positions:
+        sym = pos["symbol"]
+        entry = pos["entry_price"]
+        sl = pos["stop_loss"]
+        tp = pos["take_profit"]
+        highest = pos["highest_price"]
+        curr_price = commander.client.get_ticker_price(sym)
+
+        # Check exits
+        if curr_price <= sl:
+            print(f"[!] Stop-Loss Triggered for {sym}! Current: ${curr_price:,.2f} <= SL ${sl:,.2f}")
+            res = commander.execute_ai_order(sym, "SELL", f"Stop-Loss hit at ${curr_price:.2f}")
+            print(f"    Executed Exit: {res}")
+        elif curr_price >= tp:
+            print(f"[!] Take-Profit Triggered for {sym}! Current: ${curr_price:,.2f} >= TP ${tp:,.2f}")
+            res = commander.execute_ai_order(sym, "SELL", f"Take-Profit hit at ${curr_price:.2f}")
+            print(f"    Executed Exit: {res}")
+        else:
+            pnl_pct = ((curr_price - entry) / entry) * 100
+            print(f"[-] Holding {sym}: Price ${curr_price:,.2f} | Unrealized PnL: {pnl_pct:+.2f}%")
+
+    # 2. Analyze market opportunities for new entries
+    candidate_setups = []
+
+    for sym, pdata in pairs.items():
+        if "error" in pdata:
+            continue
+        snap = pdata["snapshot"]
+        recent = pdata["recent_candles"]
+        price = snap["close"]
+        rsi = snap["rsi_14"]
+        macd_hist = snap["macd_hist"]
+        prev_macd_hist = snap["prev_macd_hist"]
+        regime = snap["regime"]
+        atr = snap["atr_14"]
+
+        # Check if we already hold an open position in this coin
+        if any(p["symbol"] == sym for p in positions):
+            continue
+
+        # AI Decision Logic:
+        # We look for two distinct Halal Spot setups:
+        # A) Trend Continuation (Strong Bullish + RSI healthy + volume)
+        # B) Oversold Bounce Reversal (RSI < 25 + Lower shadow hammer + MACD histogram curling up)
+        
+        last_candle = recent[-1]
+        prev_candle = recent[-2] if len(recent) > 1 else last_candle
+        lower_shadow = min(last_candle["close"], snap["open"]) - last_candle["low"]
+        body = abs(last_candle["close"] - snap["open"])
+        is_hammer_wick = lower_shadow > (body * 1.5) if body > 0 else False
+        macd_curling_up = macd_hist > prev_macd_hist
+
+        score = 0.0
+        reasons = []
+
+        if regime in ["STRONG_BULLISH", "MODERATE_BULLISH"]:
+            score += 0.50
+            reasons.append("Bullish Trend Structure")
+        elif rsi < 25.0 and macd_curling_up:
+            score += 0.40
+            reasons.append(f"Deep Oversold capitulation (RSI {rsi:.1f}) with MACD curling up")
+            if is_hammer_wick:
+                score += 0.25
+                reasons.append("Bullish rejection hammer wick printed on 15m")
+
+        if snap["vol_ratio"] > 1.2:
+            score += 0.15
+            reasons.append(f"Volume spike ({snap['vol_ratio']:.2f}x average)")
+
+        print(f"  > {sym:<8}: ${price:>9,.2f} | RSI {rsi:>4.1f} | AI Conviction: {score:.2f} | Notes: {'; '.join(reasons) if reasons else 'No confluence'}")
+
+        # If conviction >= 0.65, mark as approved candidate
+        if score >= 0.65:
+            candidate_setups.append({
+                "symbol": sym,
+                "price": price,
+                "score": score,
+                "atr": atr,
+                "reasons": "; ".join(reasons)
+            })
+
+    # 3. Direct Autonomous Order Placement (Zero Human Intervention)
+    if candidate_setups and cash >= 20.0:
+        # Sort by conviction score
+        candidate_setups.sort(key=lambda x: x["score"], reverse=True)
+        best = candidate_setups[0]
+        sym = best["symbol"]
+        price = best["price"]
+        atr = best["atr"]
+
+        sl = round(price - (1.8 * atr), 4)
+        tp = round(price + (3.2 * atr), 4)
+        rationale = f"AI Direct Approval: {best['reasons']} (Conviction {best['score']:.2f})"
+
+        print(f"\n[+] AI DECISION: HIGH-CONVICTION OPPORTUNITY DETECTED ON {sym}!")
+        print(f"    Target Entry: ${price:,.2f} | Stop-Loss: ${sl:,.2f} | Take-Profit: ${tp:,.2f}")
+        print(f"    Executing order autonomously without human intervention...")
+
+        order_res = commander.execute_ai_order(
+            symbol=sym,
+            action="BUY",
+            rationale=rationale,
+            stop_loss=sl,
+            take_profit=tp
+        )
+
+        if order_res.get("success"):
+            print(f"[OK] ORDER PLACED SUCCESSFULLY: {order_res['type']} {sym} - Qty: {order_res['quantity']} @ ${order_res['price']:,.2f}")
+        else:
+            print(f"[!] Order rejected by risk manager: {order_res.get('reason')}")
+    else:
+        print("\n[-] AI DECISION: HOLD 100% CASH. No setup reached the 0.65 conviction threshold.")
+        print("    Capital preservation in effect. Waiting for market stabilization.")
+
+    print("=" * 70)
+
+if __name__ == "__main__":
+    run_ai_trading_turn()

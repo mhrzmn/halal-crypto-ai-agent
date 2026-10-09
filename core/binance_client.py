@@ -1,0 +1,196 @@
+"""
+Binance Spot API Client.
+Strictly restricted to Spot Market endpoints (/api/v3/*).
+Protected by ShariahComplianceGuard to eliminate Riba, Margin, and Derivatives.
+"""
+
+import time
+import hmac
+import hashlib
+from typing import Dict, Any, List, Optional
+from urllib.parse import urlencode
+import requests
+import pandas as pd
+
+from config.settings import settings
+from config.halal_whitelist import is_pair_halal, get_base_and_quote
+from core.shariah_guard import ShariahComplianceGuard, ShariahViolationError
+
+class BinanceSpotClient:
+    """Production-ready Binance Spot Client with Shariah Guard."""
+
+    LIVE_BASE_URL = "https://api.binance.com"
+    TESTNET_BASE_URL = "https://testnet.binance.vision"
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
+        use_testnet: bool = False
+    ):
+        self.api_key = (api_key or settings.BINANCE_API_KEY or "").strip()
+        self.api_secret = (api_secret or settings.BINANCE_API_SECRET or "").strip()
+        self.use_testnet = use_testnet or settings.BINANCE_USE_TESTNET
+        self.base_url = self.TESTNET_BASE_URL if self.use_testnet else self.LIVE_BASE_URL
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "HalalCryptoAIAgent/1.0",
+            "Accept": "application/json"
+        })
+        if self.api_key:
+            self.session.headers.update({"X-MBX-APIKEY": self.api_key})
+
+    def _sign_params(self, params: Dict[str, Any]) -> str:
+        """Create HMAC-SHA256 signature for authenticated requests."""
+        if not self.api_secret:
+            raise ValueError("Binance API Secret is required for authenticated requests.")
+        query_string = urlencode(params)
+        signature = hmac.new(
+            self.api_secret.encode("utf-8"),
+            query_string.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+        return f"{query_string}&signature={signature}"
+
+    def _request(
+        self,
+        method: str,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+        signed: bool = False
+    ) -> Any:
+        """Execute HTTP request with strict Shariah guard verification."""
+        # Enforce endpoint sanitation
+        ShariahComplianceGuard.sanitize_api_endpoint(endpoint)
+
+        url = f"{self.base_url}{endpoint}"
+        req_params = params.copy() if params else {}
+
+        if signed:
+            if not self.api_key or not self.api_secret:
+                raise ValueError("Binance API Key and Secret are required for signed operations.")
+            req_params["timestamp"] = int(time.time() * 1000)
+            req_params["recvWindow"] = 5000
+            query_string = self._sign_params(req_params)
+            url = f"{url}?{query_string}"
+            req_params = None
+
+        max_retries = 3
+        last_exception = None
+
+        for attempt in range(max_retries):
+            try:
+                response = self.session.request(method=method, url=url, params=req_params, timeout=10)
+                if response.status_code >= 400:
+                    try:
+                        err_data = response.json()
+                        msg = err_data.get("msg", response.text)
+                        code = err_data.get("code", response.status_code)
+                        raise RuntimeError(f"Binance API Error [{code}]: {msg}")
+                    except ValueError:
+                        response.raise_for_status()
+                return response.json()
+            except (requests.exceptions.RequestException, requests.exceptions.ConnectionError) as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    time.sleep(1.0 * (attempt + 1))
+                else:
+                    raise last_exception
+
+        raise last_exception if last_exception else RuntimeError("Request failed after retries.")
+
+    def ping(self) -> bool:
+        """Test connectivity to Binance Spot API."""
+        try:
+            res = self._request("GET", "/api/v3/ping")
+            return res == {}
+        except Exception:
+            return False
+
+    def get_server_time(self) -> int:
+        """Fetch official Binance server timestamp."""
+        res = self._request("GET", "/api/v3/time")
+        return res.get("serverTime", int(time.time() * 1000))
+
+    def get_ticker_price(self, symbol: str) -> float:
+        """Get latest spot market price for a symbol."""
+        ShariahComplianceGuard.audit_symbol(symbol)
+        res = self._request("GET", "/api/v3/ticker/price", params={"symbol": symbol.upper()})
+        return float(res["price"])
+
+    def get_klines(
+        self,
+        symbol: str,
+        interval: str = "15m",
+        limit: int = 100
+    ) -> pd.DataFrame:
+        """
+        Fetch OHLCV candlestick data for a Halal symbol.
+        Returns a clean pandas DataFrame with typed columns.
+        """
+        ShariahComplianceGuard.audit_symbol(symbol)
+        raw_candles = self._request(
+            "GET",
+            "/api/v3/klines",
+            params={
+                "symbol": symbol.upper(),
+                "interval": interval,
+                "limit": limit
+            }
+        )
+
+        columns = [
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_asset_volume", "number_of_trades",
+            "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore"
+        ]
+        df = pd.DataFrame(raw_candles, columns=columns)
+
+        # Convert datatypes
+        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+        df["close_time"] = pd.to_datetime(df["close_time"], unit="ms")
+        numeric_cols = ["open", "high", "low", "close", "volume", "quote_asset_volume"]
+        for col in numeric_cols:
+            df[col] = df[col].astype(float)
+
+        df.set_index("open_time", inplace=True)
+        return df
+
+    def get_spot_account_balance(self, asset: str = "USDT") -> float:
+        """Fetch available Spot balance for an asset."""
+        account_info = self._request("GET", "/api/v3/account", signed=True)
+        balances = account_info.get("balances", [])
+        for b in balances:
+            if b.get("asset") == asset.upper():
+                return float(b.get("free", 0.0))
+        return 0.0
+
+    def place_spot_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: Optional[float] = None,
+        order_type: str = "MARKET"
+    ) -> Dict[str, Any]:
+        """
+        Execute an unleveraged Spot trade on Binance.
+        Enforces Shariah audits prior to transmission.
+        """
+        ShariahComplianceGuard.audit_symbol(symbol)
+        ShariahComplianceGuard.audit_order_type(side=side, order_type=order_type, leverage=1.0)
+
+        params: Dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "side": side.upper(),
+            "type": order_type.upper(),
+            "quantity": f"{quantity:.6f}".rstrip("0").rstrip("."),
+        }
+
+        if order_type.upper() == "LIMIT":
+            if price is None:
+                raise ValueError("Price is required for LIMIT spot orders.")
+            params["price"] = f"{price:.4f}"
+            params["timeInForce"] = "GTC"
+
+        return self._request("POST", "/api/v3/order", params=params, signed=True)

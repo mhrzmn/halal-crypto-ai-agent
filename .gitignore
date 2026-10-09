@@ -1,0 +1,39 @@
+# Environment & Secret API Keys (NEVER COMMIT)
+.env
+.env.local
+.env.*.local
+
+# SQLite Databases & Local Storage
+*.db
+*.sqlite
+*.sqlite3
+storage/*.db
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Generated
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log

@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Halal AI Spot Trading Terminal</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Chart.js -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        darkbg: '#0B0E14',
+                        cardbg: '#151922',
+                        bordercolor: '#222836',
+                        emeraldgreen: '#00C087',
+                        crimsonred: '#F6465D',
+                        binanceyellow: '#F3BA2F'
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        .glass-card { background: #151922; border: 1px solid #222836; border-radius: 0.75rem; }
+    </style>
+</head>
+<body class="bg-darkbg text-gray-200 min-h-screen p-4 md:p-6">
+
+    <!-- Header Navigation Bar -->
+    <header class="flex flex-col md:flex-row justify-between items-start md:items-center pb-6 border-b border-bordercolor gap-4">
+        <div>
+            <div class="flex items-center gap-3">
+                <span class="text-2xl font-black tracking-tight text-white flex items-center gap-2">
+                    <span class="text-emeraldgreen">HALAL AI</span> TRADER
+                </span>
+                <span id="modeBadge" class="px-3 py-1 text-xs font-bold uppercase rounded-full bg-yellow-500/20 text-yellow-400 border border-yellow-500/30">
+                    DEMO SANDBOX
+                </span>
+                <span class="px-3 py-1 text-xs font-semibold rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                    100% SHARIAH SPOT
+                </span>
+            </div>
+            <p class="text-xs text-gray-400 mt-1">Process Over Profit • Autonomous AI Forecast & Zero-Intervention Spot Execution</p>
+        </div>
+
+        <!-- Header Actions -->
+        <div class="flex flex-wrap items-center gap-3 w-full md:w-auto">
+            <!-- Adaptive Timer Pill -->
+            <div class="glass-card px-4 py-2 flex items-center gap-2 text-xs">
+                <span class="w-2.5 h-2.5 rounded-full bg-emeraldgreen animate-ping"></span>
+                <span class="text-gray-400">Next AI Prediction in:</span>
+                <span id="timerCountdown" class="font-mono font-bold text-white text-sm">--:--</span>
+                <span class="text-[10px] text-gray-500">(Token Saver)</span>
+            </div>
+
+            <!-- Force Scan Button -->
+            <button onclick="forceScan()" class="bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold px-4 py-2 rounded-lg transition shadow-sm flex items-center gap-1.5">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
+                AI Scan Now
+            </button>
+
+            <!-- Settings Modal Button -->
+            <button onclick="openSettings()" class="bg-gray-800 hover:bg-gray-700 text-gray-200 text-xs font-bold px-4 py-2 rounded-lg border border-bordercolor transition">
+                Settings / Models
+            </button>
+
+            <!-- Emergency Panic Sell -->
+            <button onclick="panicSell()" class="bg-crimsonred hover:bg-red-600 text-white text-xs font-bold px-4 py-2 rounded-lg transition shadow-sm">
+                Flatten All to Cash
+            </button>
+        </div>
+    </header>
+
+    <!-- Top KPI Metrics -->
+    <section class="grid grid-cols-2 md:grid-cols-5 gap-4 my-6">
+        <!-- Card 1: Total Equity -->
+        <div class="glass-card p-4">
+            <span class="text-xs text-gray-400 font-medium">Portfolio Net Worth</span>
+            <div class="text-2xl font-black text-white mt-1" id="totalEquity">$0.00</div>
+            <div class="text-[11px] text-gray-400 mt-1 flex justify-between">
+                <span>Cash: <span id="cashBalance" class="text-emeraldgreen font-semibold">$0.00</span></span>
+                <span>Invested: <span id="investedValue" class="text-gray-300 font-semibold">$0.00</span></span>
+            </div>
+        </div>
+
+        <!-- Card 2: Net PnL -->
+        <div class="glass-card p-4">
+            <span class="text-xs text-gray-400 font-medium">Net Realized PnL</span>
+            <div class="text-2xl font-black text-white mt-1" id="netPnl">$0.00</div>
+            <div class="text-[11px] text-gray-400 mt-1">
+                Gross: <span id="grossPnl" class="font-medium text-gray-300">$0.00</span>
+            </div>
+        </div>
+
+        <!-- Card 3: Total Fees Paid -->
+        <div class="glass-card p-4">
+            <span class="text-xs text-gray-400 font-medium">Total Fees Paid (0.1% Spot)</span>
+            <div class="text-2xl font-black text-yellow-400 mt-1" id="totalFees">$0.00</div>
+            <div class="text-[11px] text-gray-400 mt-1">Real Binance Spot fee rate</div>
+        </div>
+
+        <!-- Card 4: Trade Accuracy / Win Rate -->
+        <div class="glass-card p-4">
+            <span class="text-xs text-gray-400 font-medium">Trade Accuracy (Win Rate)</span>
+            <div class="text-2xl font-black text-white mt-1" id="winRate">0.0%</div>
+            <div class="text-[11px] text-gray-400 mt-1">
+                <span id="winCount" class="text-emeraldgreen font-semibold">0</span> Wins / <span id="lossCount" class="text-crimsonred font-semibold">0</span> Losses
+            </div>
+        </div>
+
+        <!-- Card 5: Target Progress -->
+        <div class="glass-card p-4 col-span-2 md:col-span-1">
+            <span class="text-xs text-gray-400 font-medium">Profit Target Goal</span>
+            <div class="text-2xl font-black text-white mt-1" id="goalProgress">+0.00%</div>
+            <div class="w-full bg-gray-800 rounded-full h-1.5 mt-2 overflow-hidden">
+                <div id="goalProgressBar" class="bg-emeraldgreen h-1.5 rounded-full" style="width: 0%"></div>
+            </div>
+        </div>
+    </section>
+
+    <!-- Main Grid: Charts & AI Brain Feed -->
+    <section class="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-6">
+        <!-- Live Equity Curve (2 Columns) -->
+        <div class="glass-card p-5 lg:col-span-2">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-sm font-bold text-white flex items-center gap-2">
+                    <svg class="w-4 h-4 text-emeraldgreen" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z"/></svg>
+                    Live Equity Growth Curve
+                </h3>
+                <span class="text-xs text-gray-400">Auto-refreshing live</span>
+            </div>
+            <div class="h-64 relative">
+                <canvas id="equityChart"></canvas>
+            </div>
+        </div>
+
+        <!-- AI Brain Forecast Card (1 Column) -->
+        <div class="glass-card p-5 flex flex-col justify-between border-t-2 border-t-blue-500">
+            <div>
+                <div class="flex justify-between items-center mb-3">
+                    <h3 class="text-sm font-bold text-white flex items-center gap-2">
+                        <span class="w-2 h-2 rounded-full bg-blue-500 animate-pulse"></span>
+                        AI Prediction Brain
+                    </h3>
+                    <span id="aiModelBadge" class="text-[11px] font-mono px-2 py-0.5 rounded bg-gray-800 text-blue-400 border border-gray-700">
+                        gemini-1.5-flash
+                    </span>
+                </div>
+
+                <!-- Predicted Trajectory -->
+                <div class="bg-gray-900/80 rounded-lg p-3 border border-bordercolor mb-3">
+                    <div class="text-[11px] text-gray-400 uppercase font-semibold">Forecasted Trajectory</div>
+                    <div id="predictedDirection" class="text-lg font-black text-emeraldgreen mt-0.5">ANALYZING...</div>
+                    <div class="flex justify-between text-xs text-gray-300 mt-2 pt-2 border-t border-gray-800">
+                        <span>Target: <strong id="predTarget" class="text-white">$0.00</strong></span>
+                        <span>Invalidation: <strong id="predInvalidation" class="text-crimsonred">$0.00</strong></span>
+                    </div>
+                </div>
+
+                <!-- Conviction Bar -->
+                <div class="mb-3">
+                    <div class="flex justify-between text-xs text-gray-400 mb-1">
+                        <span>AI Conviction Score</span>
+                        <span id="aiConvictionScore" class="font-bold text-white">0%</span>
+                    </div>
+                    <div class="w-full bg-gray-800 rounded-full h-2 overflow-hidden">
+                        <div id="aiConvictionBar" class="bg-blue-500 h-2 rounded-full transition-all duration-500" style="width: 0%"></div>
+                    </div>
+                </div>
+
+                <!-- Thesis Rationale -->
+                <div class="text-xs text-gray-300 leading-relaxed bg-gray-900/40 p-3 rounded-lg border border-bordercolor">
+                    <span class="text-gray-500 font-semibold block mb-1">Market Structure Thesis:</span>
+                    <p id="aiThesisText" class="italic text-gray-400">Waiting for first forecast...</p>
+                </div>
+            </div>
+
+            <!-- Strategic Sleep Indicator -->
+            <div class="text-[11px] text-gray-400 mt-4 pt-3 border-t border-bordercolor flex justify-between items-center">
+                <span>Adaptive Recheck Interval:</span>
+                <span id="aiSleepDuration" class="font-bold text-white">15 minutes</span>
+            </div>
+        </div>
+    </section>
+
+    <!-- Lower Section: Active Positions & Trade History -->
+    <section class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <!-- Active Spot Positions -->
+        <div class="glass-card p-5">
+            <h3 class="text-sm font-bold text-white mb-3 flex items-center gap-2">
+                <span class="w-2 h-2 rounded-full bg-emeraldgreen"></span>
+                Active Spot Positions (100% Owned Digital Property)
+            </h3>
+            <div id="activePositionsContainer" class="space-y-3">
+                <p class="text-xs text-gray-500 italic py-4">No open positions currently active. Capital preserved in cash.</p>
+            </div>
+        </div>
+
+        <!-- Trade History & Fees Paid -->
+        <div class="glass-card p-5">
+            <h3 class="text-sm font-bold text-white mb-3 flex items-center gap-2">
+                <svg class="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"/></svg>
+                Closed Trades History & Fee Auditing
+            </h3>
+            <div class="overflow-x-auto max-h-72">
+                <table class="w-full text-left text-xs">
+                    <thead class="text-[11px] text-gray-400 border-b border-bordercolor bg-gray-900/50 sticky top-0">
+                        <tr>
+                            <th class="py-2 px-2">Symbol</th>
+                            <th class="py-2 px-2">Buy</th>
+                            <th class="py-2 px-2">Sell</th>
+                            <th class="py-2 px-2">Fee</th>
+                            <th class="py-2 px-2">Net PnL</th>
+                            <th class="py-2 px-2">Result</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tradeHistoryBody" class="divide-y divide-bordercolor">
+                        <tr><td colspan="6" class="py-4 text-center text-gray-500 italic">No closed trades recorded yet.</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </section>
+
+    <!-- Settings Modal -->
+    <div id="settingsModal" class="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 hidden flex items-center justify-center p-4">
+        <div class="glass-card w-full max-w-md p-6 bg-cardbg border-bordercolor">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-lg font-bold text-white">System & Model Controls</h3>
+                <button onclick="closeSettings()" class="text-gray-400 hover:text-white">&times;</button>
+            </div>
+
+            <!-- Mode Toggle -->
+            <div class="mb-4">
+                <label class="block text-xs font-semibold text-gray-400 mb-1">Trading Mode</label>
+                <select id="settingMode" class="w-full bg-gray-900 border border-bordercolor rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
+                    <option value="true">DEMO SANDBOX (Simulated Risk-Free)</option>
+                    <option value="false">REAL BINANCE SPOT (Live Account)</option>
+                </select>
+            </div>
+
+            <!-- AI Model Selector -->
+            <div class="mb-4">
+                <label class="block text-xs font-semibold text-gray-400 mb-1">AI Prediction Model</label>
+                <select id="settingModel" onchange="toggleCustomFields()" class="w-full bg-gray-900 border border-bordercolor rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
+                    <option value="gemini-1.5-flash">Google Gemini 1.5 Flash (Fast, Token-Efficient)</option>
+                    <option value="gemini-1.5-pro">Google Gemini 1.5 Pro (Deep Multi-Step Reasoning)</option>
+                    <option value="gpt-4o-mini">OpenAI GPT-4o-mini</option>
+                    <option value="gpt-4o">OpenAI GPT-4o</option>
+                    <option value="deepseek-chat">DeepSeek V3 / R1 (Direct)</option>
+                    <option value="custom">★ Custom Model & Base URL (OpenRouter, Groq, Ollama, etc.)</option>
+                    <option value="algorithmic">Offline Quantitative Forecaster (No API Key)</option>
+                </select>
+            </div>
+
+            <!-- Custom Endpoint Section -->
+            <div id="customEndpointSection" class="p-3 bg-gray-900/90 rounded-lg border border-bordercolor mb-4 space-y-3">
+                <div class="flex justify-between items-center">
+                    <span class="text-xs font-bold text-blue-400">Custom Provider Configuration</span>
+                    <span class="text-[10px] text-gray-400">OpenAI-Compatible</span>
+                </div>
+
+                <!-- Quick Presets -->
+                <div>
+                    <label class="block text-[11px] text-gray-400 mb-1">Quick Presets:</label>
+                    <div class="flex flex-wrap gap-1.5 text-[10px]">
+                        <button type="button" onclick="setPreset('https://api.deepseek.com/v1', 'deepseek-chat')" class="bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded text-gray-300 border border-bordercolor">DeepSeek</button>
+                        <button type="button" onclick="setPreset('https://openrouter.ai/api/v1', 'deepseek/deepseek-r1')" class="bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded text-gray-300 border border-bordercolor">OpenRouter</button>
+                        <button type="button" onclick="setPreset('https://api.groq.com/openai/v1', 'llama-3.3-70b-versatile')" class="bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded text-gray-300 border border-bordercolor">Groq</button>
+                        <button type="button" onclick="setPreset('http://localhost:11434/v1', 'llama3')" class="bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded text-gray-300 border border-bordercolor">Ollama (Local)</button>
+                        <button type="button" onclick="setPreset('http://localhost:1234/v1', 'local-model')" class="bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded text-gray-300 border border-bordercolor">LM Studio</button>
+                    </div>
+                </div>
+
+                <div>
+                    <label class="block text-[11px] text-gray-400 mb-1">Custom Base URL</label>
+                    <input type="text" id="settingCustomUrl" placeholder="https://api.deepseek.com/v1" class="w-full bg-black/60 border border-bordercolor rounded px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500 font-mono">
+                </div>
+
+                <div>
+                    <label class="block text-[11px] text-gray-400 mb-1">Custom Model Name</label>
+                    <input type="text" id="settingCustomModel" placeholder="deepseek-chat or custom model ID" class="w-full bg-black/60 border border-bordercolor rounded px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500 font-mono">
+                </div>
+
+                <div>
+                    <label class="block text-[11px] text-gray-400 mb-1">API Key / Bearer Token (optional for local)</label>
+                    <input type="password" id="settingCustomKey" placeholder="Paste custom API key or leave blank for local..." class="w-full bg-black/60 border border-bordercolor rounded px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-blue-500 font-mono">
+                </div>
+            </div>
+
+            <!-- Standard API Keys -->
+            <div id="geminiKeySection" class="mb-3">
+                <label class="block text-xs font-semibold text-gray-400 mb-1">Google Gemini API Key</label>
+                <input type="password" id="settingGeminiKey" placeholder="Paste Gemini API key..." class="w-full bg-gray-900 border border-bordercolor rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
+            </div>
+
+            <div id="openaiKeySection" class="mb-4">
+                <label class="block text-xs font-semibold text-gray-400 mb-1">OpenAI API Key (For GPT-4o / GPT-4o-mini)</label>
+                <input type="password" id="settingOpenAIKey" placeholder="sk-..." class="w-full bg-gray-900 border border-bordercolor rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
+            </div>
+
+            <!-- Target Profit Goal -->
+            <div class="mb-4">
+                <label class="block text-xs font-semibold text-gray-400 mb-1">Profit Target Goal (%)</label>
+                <input type="number" id="settingTargetGoal" value="5.0" step="0.5" class="w-full bg-gray-900 border border-bordercolor rounded-lg px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500">
+            </div>
+
+            <!-- Reset Demo Balance -->
+            <div class="mb-6">
+                <label class="block text-xs font-semibold text-gray-400 mb-1">Reset Demo Balance (USDT)</label>
+                <div class="flex gap-2">
+                    <button type="button" onclick="setDemoBal(500)" class="flex-1 bg-gray-800 hover:bg-gray-700 text-xs py-1.5 rounded border border-bordercolor">$500</button>
+                    <button type="button" onclick="setDemoBal(1000)" class="flex-1 bg-gray-800 hover:bg-gray-700 text-xs py-1.5 rounded border border-bordercolor">$1,000</button>
+                    <button type="button" onclick="setDemoBal(5000)" class="flex-1 bg-gray-800 hover:bg-gray-700 text-xs py-1.5 rounded border border-bordercolor">$5,000</button>
+                </div>
+            </div>
+
+            <!-- Modal Action Buttons -->
+            <div class="flex justify-end gap-3">
+                <button onclick="closeSettings()" class="px-4 py-2 text-xs font-semibold text-gray-400 hover:text-white">Cancel</button>
+                <button onclick="saveSettings()" class="px-5 py-2 text-xs font-bold bg-blue-600 hover:bg-blue-500 text-white rounded-lg transition">Save Changes</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- JavaScript Application Logic -->
+    <script>
+        let equityChartInstance = null;
+        let selectedResetBal = null;
+
+        function setDemoBal(amount) {
+            selectedResetBal = amount;
+            alert('Reset demo balance to $' + amount + ' set. Click "Save Changes" to apply.');
+        }
+
+        // Initialize Chart.js
+        function initChart() {
+            const ctx = document.getElementById('equityChart').getContext('2d');
+            equityChartInstance = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [
+                        {
+                            label: 'Total Net Worth ($)',
+                            data: [],
+                            borderColor: '#00C087',
+                            backgroundColor: 'rgba(0, 192, 135, 0.08)',
+                            borderWidth: 2,
+                            fill: true,
+                            tension: 0.35,
+                            pointRadius: 2
+                        },
+                        {
+                            label: 'Available Cash ($)',
+                            data: [],
+                            borderColor: '#3B82F6',
+                            borderDash: [4, 4],
+                            borderWidth: 1.5,
+                            fill: false,
+                            tension: 0.35,
+                            pointRadius: 0
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        legend: { labels: { color: '#9CA3AF', font: { size: 11 } } }
+                    },
+                    scales: {
+                        x: { grid: { color: '#1F2937' }, ticks: { color: '#9CA3AF', font: { size: 10 } } },
+                        y: { grid: { color: '#1F2937' }, ticks: { color: '#9CA3AF', font: { size: 10 } } }
+                    }
+                }
+            });
+        }
+
+        // Fetch Live Dashboard Status
+        async function fetchStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+                window.currentServerStatus = data;
+
+                // Top KPIs
+                document.getElementById('totalEquity').innerText = '$' + data.total_equity.toLocaleString(undefined, {minimumFractionDigits: 2});
+                document.getElementById('cashBalance').innerText = '$' + data.cash_balance.toFixed(2);
+                document.getElementById('investedValue').innerText = '$' + data.invested_value.toFixed(2);
+
+                const perf = data.performance;
+                const netElem = document.getElementById('netPnl');
+                netElem.innerText = (perf.total_net_pnl >= 0 ? '+$' : '-$') + Math.abs(perf.total_net_pnl).toFixed(2);
+                netElem.className = 'text-2xl font-black mt-1 ' + (perf.total_net_pnl >= 0 ? 'text-emeraldgreen' : 'text-crimsonred');
+                document.getElementById('grossPnl').innerText = '$' + perf.total_gross_pnl.toFixed(2);
+                document.getElementById('totalFees').innerText = '$' + perf.total_fees_paid.toFixed(2);
+                document.getElementById('winRate').innerText = perf.win_rate + '%';
+                document.getElementById('winCount').innerText = perf.win_count;
+                document.getElementById('lossCount').innerText = perf.loss_count;
+
+                // Mode Badge
+                const modeBadge = document.getElementById('modeBadge');
+                modeBadge.innerText = data.mode_label;
+                modeBadge.className = data.is_paper 
+                    ? 'px-3 py-1 text-xs font-bold uppercase rounded-full bg-yellow-500/20 text-yellow-400 border border-yellow-500/30'
+                    : 'px-3 py-1 text-xs font-bold uppercase rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30';
+
+                // Goal Progress
+                document.getElementById('goalProgress').innerText = (data.current_profit_pct >= 0 ? '+' : '') + data.current_profit_pct + '%';
+                const progressWidth = Math.min(100, Math.max(0, (data.current_profit_pct / data.target_profit_percent) * 100));
+                document.getElementById('goalProgressBar').style.width = progressWidth + '%';
+
+                // Timer Countdown
+                const mins = Math.floor(data.next_recheck_seconds / 60);
+                const secs = data.next_recheck_seconds % 60;
+                document.getElementById('timerCountdown').innerText = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+                document.getElementById('aiSleepDuration').innerText = data.next_recheck_minutes + ' minutes';
+                document.getElementById('aiModelBadge').innerText = data.current_model;
+
+                // AI Prediction Brain
+                if (data.latest_prediction) {
+                    const p = data.latest_prediction;
+                    document.getElementById('predictedDirection').innerText = p.predicted_direction.replace('_', ' ');
+                    document.getElementById('predTarget').innerText = '$' + p.target_price.toLocaleString();
+                    document.getElementById('predInvalidation').innerText = '$' + p.invalidation_price.toLocaleString();
+                    const confPct = Math.round(p.confidence * 100);
+                    document.getElementById('aiConvictionScore').innerText = confPct + '%';
+                    document.getElementById('aiConvictionBar').style.width = confPct + '%';
+                    document.getElementById('aiThesisText').innerText = `"${p.thesis}"`;
+                }
+
+                if (data.custom_base_url && !document.getElementById('settingCustomUrl').value) {
+                    document.getElementById('settingCustomUrl').value = data.custom_base_url;
+                }
+                if (data.custom_model_name && !document.getElementById('settingCustomModel').value) {
+                    document.getElementById('settingCustomModel').value = data.custom_model_name;
+                }
+
+                // Active Positions Render
+                const posContainer = document.getElementById('activePositionsContainer');
+                if (data.active_positions.length === 0) {
+                    posContainer.innerHTML = '<p class="text-xs text-gray-500 italic py-4">No open positions active. Capital preserved 100% in cash.</p>';
+                } else {
+                    posContainer.innerHTML = data.active_positions.map(p => `
+                        <div class="bg-gray-900/60 p-3 rounded-lg border border-bordercolor flex justify-between items-center">
+                            <div>
+                                <span class="font-bold text-white text-sm">${p.symbol}</span>
+                                <span class="text-xs text-gray-400 ml-2">${p.quantity} units @ $${p.entry_price.toLocaleString()}</span>
+                                <div class="text-[11px] text-gray-400 mt-1">
+                                    SL: <span class="text-crimsonred font-semibold">$${p.stop_loss}</span> | 
+                                    TP: <span class="text-emeraldgreen font-semibold">$${p.take_profit}</span>
+                                </div>
+                            </div>
+                            <div class="text-right">
+                                <div class="font-bold ${p.unrealized_pnl_pct >= 0 ? 'text-emeraldgreen' : 'text-crimsonred'}">
+                                    ${p.unrealized_pnl_pct >= 0 ? '+' : ''}${p.unrealized_pnl_pct}%
+                                </div>
+                                <div class="text-xs text-gray-400">
+                                    ${p.unrealized_pnl_usdt >= 0 ? '+$' : '-$'}${Math.abs(p.unrealized_pnl_usdt).toFixed(2)}
+                                </div>
+                            </div>
+                        </div>
+                    `).join('');
+                }
+            } catch (e) {
+                console.error("Status fetch error:", e);
+            }
+        }
+
+        // Fetch Live Chart Data
+        async function fetchChartData() {
+            try {
+                const res = await fetch('/api/chart-data');
+                const data = await res.json();
+                if (equityChartInstance && data.labels.length > 0) {
+                    equityChartInstance.data.labels = data.labels;
+                    equityChartInstance.data.datasets[0].data = data.equity;
+                    equityChartInstance.data.datasets[1].data = data.cash;
+                    equityChartInstance.update();
+                }
+            } catch (e) {
+                console.error("Chart fetch error:", e);
+            }
+        }
+
+        // Fetch Trades History
+        async function fetchTrades() {
+            try {
+                const res = await fetch('/api/trades');
+                const data = await res.json();
+                const tbody = document.getElementById('tradeHistoryBody');
+                if (data.trades.length === 0) {
+                    tbody.innerHTML = '<tr><td colspan="6" class="py-4 text-center text-gray-500 italic">No closed trades yet.</td></tr>';
+                } else {
+                    tbody.innerHTML = data.trades.slice(0, 10).map(t => {
+                        const isWin = t.pnl_net_usdt > 0;
+                        return `
+                            <tr>
+                                <td class="py-2 px-2 font-bold text-white">${t.symbol}</td>
+                                <td class="py-2 px-2 text-gray-400">$${t.buy_price.toLocaleString()}</td>
+                                <td class="py-2 px-2 text-gray-400">$${t.sell_price.toLocaleString()}</td>
+                                <td class="py-2 px-2 text-yellow-400 font-mono">$${(t.fee_usdt || 0).toFixed(2)}</td>
+                                <td class="py-2 px-2 font-bold ${isWin ? 'text-emeraldgreen' : 'text-crimsonred'}">
+                                    ${t.pnl_net_usdt >= 0 ? '+$' : '-$'}${Math.abs(t.pnl_net_usdt || t.pnl_usdt).toFixed(2)}
+                                </td>
+                                <td class="py-2 px-2">
+                                    <span class="px-2 py-0.5 text-[10px] font-bold rounded ${isWin ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'}">
+                                        ${isWin ? 'WIN' : 'LOSS'}
+                                    </span>
+                                </td>
+                            </tr>
+                        `;
+                    }).join('');
+                }
+            } catch (e) {
+                console.error("Trades fetch error:", e);
+            }
+        }
+
+        // Action Handlers
+        async function forceScan() {
+            await fetch('/api/force-scan', { method: 'POST' });
+            alert('AI Scan triggered! Analyzing market structure now...');
+            setTimeout(fetchStatus, 1500);
+        }
+
+        async function panicSell() {
+            if (confirm("Are you sure you want to FLATTEN ALL POSITIONS TO CASH immediately?")) {
+                const res = await fetch('/api/panic-sell', { method: 'POST' });
+                const data = await res.json();
+                alert(`Closed ${data.closed_positions.length} positions to cash.`);
+                fetchStatus();
+            }
+        }
+
+        function openSettings() {
+            if (window.currentServerStatus) {
+                document.getElementById('settingMode').value = window.currentServerStatus.is_paper ? 'true' : 'false';
+                if (window.currentServerStatus.target_profit_percent !== undefined) {
+                    document.getElementById('settingTargetGoal').value = window.currentServerStatus.target_profit_percent;
+                }
+                if (window.currentServerStatus.custom_base_url) {
+                    document.getElementById('settingCustomUrl').value = window.currentServerStatus.custom_base_url;
+                }
+                if (window.currentServerStatus.custom_model_name) {
+                    document.getElementById('settingCustomModel').value = window.currentServerStatus.custom_model_name;
+                }
+            }
+            document.getElementById('settingsModal').classList.remove('hidden');
+        }
+
+        function closeSettings() { document.getElementById('settingsModal').classList.add('hidden'); }
+
+        function setPreset(url, model) {
+            document.getElementById('settingModel').value = 'custom';
+            document.getElementById('settingCustomUrl').value = url;
+            document.getElementById('settingCustomModel').value = model;
+            toggleCustomFields();
+        }
+
+        function toggleCustomFields() {
+            const modelVal = document.getElementById('settingModel').value;
+            const customSec = document.getElementById('customEndpointSection');
+            if (modelVal === 'custom') {
+                customSec.classList.add('border-blue-500', 'ring-1', 'ring-blue-500/40');
+            } else {
+                customSec.classList.remove('border-blue-500', 'ring-1', 'ring-blue-500/40');
+            }
+        }
+
+        async function saveSettings() {
+            const isPaper = document.getElementById('settingMode').value === 'true';
+            const model = document.getElementById('settingModel').value;
+            const geminiKey = document.getElementById('settingGeminiKey').value.trim();
+            const openaiKey = document.getElementById('settingOpenAIKey') ? document.getElementById('settingOpenAIKey').value.trim() : '';
+            const customUrl = document.getElementById('settingCustomUrl').value.trim();
+            const customModel = document.getElementById('settingCustomModel').value.trim();
+            const customKey = document.getElementById('settingCustomKey').value.trim();
+            const targetGoal = parseFloat(document.getElementById('settingTargetGoal').value);
+
+            const payload = {
+                is_paper: isPaper,
+                model_provider: model,
+                target_profit_percent: targetGoal,
+                custom_base_url: customUrl,
+                custom_model_name: customModel,
+                custom_api_key: customKey
+            };
+            if (geminiKey) payload.gemini_api_key = geminiKey;
+            if (openaiKey) payload.openai_api_key = openaiKey;
+            if (selectedResetBal) payload.reset_demo_balance = selectedResetBal;
+
+            await fetch('/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload)
+            });
+
+            closeSettings();
+            alert('Settings & Model configuration saved successfully!');
+            fetchStatus();
+            fetchChartData();
+        }
+
+        // Initialization & Auto-Polling
+        window.onload = () => {
+            initChart();
+            fetchStatus();
+            fetchChartData();
+            fetchTrades();
+            setInterval(fetchStatus, 3000);     // Update KPIs & timers every 3s
+            setInterval(fetchChartData, 10000);  // Update chart every 10s
+            setInterval(fetchTrades, 10000);     // Update trades every 10s
+        };
+    </script>
+</body>
+</html>
