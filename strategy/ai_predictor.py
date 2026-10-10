@@ -266,15 +266,51 @@ Respond strictly in valid JSON with these keys:
 """
 
     def _parse_llm_json(self, data: Dict[str, Any], symbol: str, current_price: float, model: str) -> AIPredictionResult:
-        """Parse validated JSON response from LLM."""
+        """Parse and SANITIZE the JSON response from an LLM (never trust it blindly)."""
         action = str(data.get("action", "HOLD")).upper().strip()
         if action not in ["BUY", "SELL", "HOLD"]:
             action = "HOLD"
 
-        target_p = float(data.get("target_price", round(current_price * 1.03, 2)))
-        sl_p = float(data.get("invalidation_price", round(current_price * 0.98, 2)))
-        confidence = float(data.get("confidence", 0.50))
-        recheck_min = int(data.get("next_recheck_minutes", 15))
+        try:
+            target_p = float(data.get("target_price", 0.0))
+        except (TypeError, ValueError):
+            target_p = 0.0
+        try:
+            sl_p = float(data.get("invalidation_price", 0.0))
+        except (TypeError, ValueError):
+            sl_p = 0.0
+
+        # Clamp confidence to [0.0, 1.0]
+        try:
+            confidence = float(data.get("confidence", 0.50))
+        except (TypeError, ValueError):
+            confidence = 0.50
+        confidence = max(0.0, min(1.0, confidence))
+
+        # Sanity-clamp hallucinated price levels to plausible ATR-based bands
+        atr = None
+        try:
+            atr = float(data.get("__atr")) if data.get("__atr") else None
+        except (TypeError, ValueError):
+            atr = None
+
+        # Reject hallucinated levels outright
+        max_reasonable = current_price * 1.50   # > +50% target on a 1-4h horizon is nonsense
+        min_reasonable = current_price * 0.50   # > -50% stop is nonsense
+        if not (min_reasonable < target_p < max_reasonable) or target_p <= current_price:
+            target_p = round(current_price * 1.03, 2)
+        if not (min_reasonable < sl_p < max_reasonable) or sl_p >= current_price:
+            sl_p = round(current_price * 0.98, 2)
+
+        # If LLM levels are degenerate, it isn't trustworthy enough to trade
+        if action == "BUY" and (sl_p >= current_price or target_p <= current_price):
+            action = "HOLD"
+            confidence = min(confidence, 0.40)
+
+        try:
+            recheck_min = int(data.get("next_recheck_minutes", 15))
+        except (TypeError, ValueError):
+            recheck_min = 15
         recheck_min = max(5, min(60, recheck_min))
 
         return AIPredictionResult(

@@ -122,15 +122,53 @@ Respond strictly with valid JSON with these keys:
             temperature=0.2
         )
         content = json.loads(response.choices[0].message.content)
+        action, confidence, sl, tp = self._sanitize_llm_output(content, signal, snapshot["close"])
         return AIAssessment(
-            action=content.get("action", signal.action),
-            confidence=float(content.get("confidence", signal.confidence)),
-            recommended_stop_loss=float(content.get("stop_loss", signal.stop_loss)),
-            recommended_take_profit=float(content.get("take_profit", signal.take_profit)),
+            action=action,
+            confidence=confidence,
+            recommended_stop_loss=sl,
+            recommended_take_profit=tp,
             rationale=content.get("rationale", signal.rationale),
             risk_assessment=f"AI Risk Rating: {content.get('risk_level', 'MODERATE')}",
             provider="OpenAI LLM"
         )
+
+    @staticmethod
+    def _sanitize_llm_output(
+        content: Dict[str, Any],
+        signal: TradeSignal,
+        current_price: float
+    ) -> tuple:
+        """Clamp hallucinated LLM outputs to sane, tradeable values."""
+        action = str(content.get("action", signal.action)).upper().strip()
+        if action not in ["BUY", "SELL", "HOLD"]:
+            action = signal.action
+
+        try:
+            confidence = float(content.get("confidence", signal.confidence))
+        except (TypeError, ValueError):
+            confidence = signal.confidence
+        confidence = max(0.0, min(1.0, confidence))
+
+        max_reasonable = current_price * 1.50
+        min_reasonable = current_price * 0.50
+
+        def _price(key: str, fallback: float, must_be_below: bool) -> float:
+            try:
+                val = float(content.get(key, fallback))
+            except (TypeError, ValueError):
+                return fallback
+            if not (min_reasonable < val < max_reasonable):
+                return fallback
+            if must_be_below and val >= current_price:
+                return fallback
+            if not must_be_below and val <= current_price:
+                return fallback
+            return val
+
+        sl = _price("stop_loss", signal.stop_loss, must_be_below=True)
+        tp = _price("take_profit", signal.take_profit, must_be_below=False)
+        return action, confidence, sl, tp
 
     def _query_gemini(self, symbol: str, snapshot: Dict[str, Any], signal: TradeSignal) -> AIAssessment:
         """Query Gemini API via REST for market analysis."""
@@ -150,12 +188,13 @@ Respond strictly with valid JSON with these keys:
         data = resp.json()
         raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
         parsed = json.loads(raw_text)
+        action, confidence, sl, tp = self._sanitize_llm_output(parsed, signal, snapshot["close"])
 
         return AIAssessment(
-            action=parsed.get("action", signal.action),
-            confidence=float(parsed.get("confidence", signal.confidence)),
-            recommended_stop_loss=float(parsed.get("stop_loss", signal.stop_loss)),
-            recommended_take_profit=float(parsed.get("take_profit", signal.take_profit)),
+            action=action,
+            confidence=confidence,
+            recommended_stop_loss=sl,
+            recommended_take_profit=tp,
             rationale=parsed.get("rationale", signal.rationale),
             risk_assessment="Gemini LLM Risk Evaluated",
             provider="Gemini LLM"

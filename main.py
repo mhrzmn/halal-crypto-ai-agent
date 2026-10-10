@@ -5,7 +5,7 @@ CLI Entrypoint and Interactive Dashboard.
 
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 import click
 from rich.console import Console
 from rich.table import Table
@@ -55,7 +55,7 @@ def test_connection():
     console.print("[yellow]Pinging Binance Spot API...[/yellow]")
     if client.ping():
         server_time = client.get_server_time()
-        time_str = datetime.utcfromtimestamp(server_time / 1000).strftime('%Y-%m-%d %H:%M:%S UTC')
+        time_str = datetime.fromtimestamp(server_time / 1000, tz=timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         console.print(f"[bold green][OK] Binance Spot API is connected successfully![/bold green] (Server Time: {time_str})")
         
         # Test BTC price fetch

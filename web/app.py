@@ -23,6 +23,7 @@ from storage.database import Database
 from strategy.indicators import IndicatorEngine
 from strategy.ai_predictor import AIPredictor, AIPredictionResult
 from risk.risk_manager import RiskManager
+from execution.bot_engine import BotEngine
 
 app = FastAPI(title="Halal Crypto AI Trading Dashboard")
 
@@ -33,6 +34,7 @@ templates = Jinja2Templates(directory="web/templates")
 db = Database()
 client = BinanceSpotClient()
 predictor = AIPredictor()
+engine = BotEngine(binance_client=client, database=db)
 
 # State for the adaptive token-saving scheduler
 scheduler_state = {
@@ -91,7 +93,8 @@ async def run_sentinel_cycle():
         highest = pos["highest_price"]
 
         try:
-            curr_price = client.get_ticker_price(sym)
+            # Blocking HTTP call moved off the event loop
+            curr_price = await asyncio.to_thread(client.get_ticker_price, sym)
             invested_val += (curr_price * qty)
 
             if curr_price > highest:
@@ -107,18 +110,22 @@ async def run_sentinel_cycle():
             )
 
             if should_exit:
-                closed = db.close_active_position(sym, curr_price, reason)
-                if is_paper and closed:
-                    bal = db.get_paper_balance()
-                    db.update_paper_balance(round(bal + (qty * curr_price), 2))
+                # Route through the engine: atomic close + balance credit (paper)
+                # or ownership-audited live sell with real fill price.
+                await asyncio.to_thread(
+                    engine._execute_sell, sym, qty, curr_price, reason
+                )
                 print(f"[Sentinel Exit Triggered]: {sym} closed at ${curr_price:.2f} ({reason})")
         except Exception as e:
             print(f"Error checking position {sym}: {e}")
 
     # Record equity snapshot for the live graph
-    cash = db.get_paper_balance() if is_paper else client.get_spot_account_balance("USDT")
-    total_equity = cash + invested_val
-    db.record_portfolio_snapshot(total_equity, cash, invested_val)
+    try:
+        cash = db.get_paper_balance() if is_paper else await asyncio.to_thread(client.get_spot_account_balance, "USDT")
+        total_equity = cash + invested_val
+        db.record_portfolio_snapshot(total_equity, cash, invested_val)
+    except Exception as e:
+        print(f"[Sentinel] Could not record equity snapshot: {e}")
 
     # 2. Check if adaptive strategic AI sleep has elapsed
     time_since_ai_scan = (now - scheduler_state["last_ai_scan_timestamp"]) / 60.0
@@ -126,101 +133,26 @@ async def run_sentinel_cycle():
         await execute_full_ai_scan()
 
 async def execute_full_ai_scan():
-    """Run pure AI market prediction across whitelisted pairs."""
+    """
+    Run one consolidated trading cycle through the shared BotEngine.
+    (Single source of truth - replaces the old duplicated scan/buy loop.)
+    """
     scheduler_state["active_scan_in_progress"] = True
     try:
-        is_paper = settings.PAPER_TRADING
-        cash = db.get_paper_balance() if is_paper else client.get_spot_account_balance("USDT")
-        positions = db.get_all_active_positions()
-        best_candidate = None
-        min_recheck_time = 60
+        result = await asyncio.to_thread(engine.scan_and_execute_cycle)
 
-        for symbol in settings.TRADING_PAIRS:
-            # Skip if we already own this asset
-            if any(p["symbol"] == symbol for p in positions):
-                continue
-
-            try:
-                df = client.get_klines(symbol, interval=settings.CANDLE_TIMEFRAME, limit=40)
-                df_calc = IndicatorEngine.calculate_all(df)
-                snapshot = IndicatorEngine.get_latest_snapshot(df_calc)
-
-                pred = predictor.predict_market_movement(
-                    symbol=symbol,
-                    df_candles=df_calc,
-                    snapshot=snapshot,
-                    has_open_position=False
-                )
-
-                # Track lowest strategic wait time
-                min_recheck_time = min(min_recheck_time, pred.next_recheck_minutes)
-
-                # Save forecast to database
-                db.save_ai_prediction(
-                    symbol=symbol,
-                    predicted_direction=pred.predicted_direction,
-                    target_price=pred.target_price,
-                    invalidation_price=pred.invalidation_price,
-                    action=pred.action,
-                    confidence=pred.confidence,
-                    current_price=pred.current_price,
-                    next_recheck_minutes=pred.next_recheck_minutes,
-                    thesis=pred.thesis,
-                    model_used=pred.model_used
-                )
-
-                if pred.action == "BUY" and pred.confidence >= settings.AI_CONFIDENCE_THRESHOLD:
-                    if not best_candidate or pred.confidence > best_candidate.confidence:
-                        best_candidate = pred
-            except Exception as e:
-                print(f"AI Scan Error for {symbol}: {e}")
-
-        # Update adaptive timer based on AI recommendation
-        scheduler_state["next_recheck_minutes"] = max(5, min_recheck_time)
+        # Adaptive timer: use shortest AI-suggested recheck, min 5 minutes
+        rechecks = [
+            p.get("next_recheck_minutes") for p in (result.get("pairs_scanned") or [])
+            if p.get("next_recheck_minutes")
+        ]
+        scheduler_state["next_recheck_minutes"] = max(5, min(rechecks)) if rechecks else 15
         scheduler_state["last_ai_scan_timestamp"] = time.time()
 
-        # Place trade if high-conviction candidate identified
-        if best_candidate and cash >= 15.0:
-            sym = best_candidate.symbol
-            curr_p = best_candidate.current_price
-            sl = best_candidate.invalidation_price
-            tp = best_candidate.target_price
-
-            size_res = RiskManager.calculate_spot_position_size(
-                available_usdt=cash,
-                current_price=curr_p,
-                stop_loss_price=sl,
-                symbol=sym
-            )
-
-            if size_res.is_valid:
-                cost = round(size_res.quantity * curr_p, 2)
-                if is_paper:
-                    db.update_paper_balance(round(cash - cost, 2))
-                    db.save_active_position(
-                        symbol=sym,
-                        quantity=size_res.quantity,
-                        entry_price=curr_p,
-                        stop_loss=sl,
-                        take_profit=tp,
-                        is_paper=True
-                    )
-                else:
-                    client.place_spot_order(
-                        symbol=sym,
-                        side="BUY",
-                        quantity=size_res.quantity,
-                        order_type="MARKET"
-                    )
-                    db.save_active_position(
-                        symbol=sym,
-                        quantity=size_res.quantity,
-                        entry_price=curr_p,
-                        stop_loss=sl,
-                        take_profit=tp,
-                        is_paper=False
-                    )
-                print(f"[AI Trade Placed]: {sym} - Qty: {size_res.quantity} @ ${curr_p:.2f} ({best_candidate.thesis})")
+        for action in result.get("actions_taken", []):
+            print(f"[Engine Action]: {action.get('type')} {action.get('symbol')} ({action.get('reason', action.get('rationale', ''))})")
+        for err in result.get("errors", []):
+            print(f"[Engine Error]: {err}")
     finally:
         scheduler_state["active_scan_in_progress"] = False
 
@@ -237,7 +169,7 @@ async def serve_dashboard(request: Request):
 async def get_dashboard_status():
     """Live status summary for UI polling."""
     is_paper = settings.PAPER_TRADING
-    cash = db.get_paper_balance() if is_paper else client.get_spot_account_balance("USDT")
+    cash = db.get_paper_balance() if is_paper else await asyncio.to_thread(client.get_spot_account_balance, "USDT")
     positions = db.get_all_active_positions()
 
     # Calculate live prices & unrealized PnL for positions
@@ -245,7 +177,7 @@ async def get_dashboard_status():
     active_cards = []
     for p in positions:
         try:
-            curr_p = client.get_ticker_price(p["symbol"])
+            curr_p = await asyncio.to_thread(client.get_ticker_price, p["symbol"])
             unrealized_pnl = (curr_p - p["entry_price"]) * p["quantity"]
             unrealized_pct = ((curr_p - p["entry_price"]) / p["entry_price"]) * 100.0
             invested_val += (curr_p * p["quantity"])
@@ -291,34 +223,64 @@ async def get_dashboard_status():
         "latest_prediction": latest_pred,
         "next_recheck_seconds": remaining_seconds,
         "next_recheck_minutes": scheduler_state["next_recheck_minutes"],
+        "is_running": scheduler_state["is_running"],
         "custom_base_url": settings.CUSTOM_BASE_URL,
         "custom_model_name": settings.CUSTOM_MODEL_NAME
     }
 
+# Supported chart timeframes: query param `range` -> hours of history (None = all)
+CHART_RANGES_HOURS = {
+    "1h": 1.0,
+    "6h": 6.0,
+    "24h": 24.0,
+    "7d": 24.0 * 7,
+    "30d": 24.0 * 30,
+    "all": None,
+}
+
 @app.get("/api/chart-data")
-async def get_chart_data():
-    """Return historical equity data for Chart.js rendering."""
-    snapshots = db.get_portfolio_snapshots(limit=100)
+async def get_chart_data(range: str = "24h"):
+    """Return historical equity data for Chart.js rendering, filtered by timeframe."""
+    range_key = (range or "24h").lower()
+    if range_key not in CHART_RANGES_HOURS:
+        range_key = "24h"
+    hours = CHART_RANGES_HOURS[range_key]
+
+    if hours is None:
+        snapshots = db.get_portfolio_snapshots(limit=100000, max_points=500)
+    else:
+        # Show intraday ranges at full resolution, downsample long ranges
+        max_pts = 300 if hours <= 24 else 500
+        snapshots = db.get_portfolio_snapshots(hours=hours, max_points=max_pts)
+
     labels = []
     equity_points = []
     cash_points = []
+    # Show date+time for multi-day ranges, time only for intraday
+    show_date = hours is None or hours > 24
 
     for s in snapshots:
-        t_str = s["timestamp"].split("T")[1][:5] if "T" in s["timestamp"] else s["timestamp"][-5:]
-        labels.append(t_str)
+        ts = s["timestamp"]
+        if "T" in ts:
+            time_part = ts.split("T")[1][:5]
+            date_part = ts.split("T")[0][5:]  # MM-DD
+            labels.append(f"{date_part} {time_part}" if show_date else time_part)
+        else:
+            labels.append(ts[-5:])
         equity_points.append(s["total_equity"])
         cash_points.append(s["cash_balance"])
 
     return {
         "labels": labels,
         "equity": equity_points,
-        "cash": cash_points
+        "cash": cash_points,
+        "range": range_key
     }
 
 @app.get("/api/trades")
 async def get_recent_trades():
     """Return trade history with fee transparency."""
-    trades = db.get_trade_history(limit=50)
+    trades = db.get_trade_history(limit=1000)
     return {"trades": trades}
 
 @app.get("/api/ai-forecasts")
@@ -426,28 +388,24 @@ async def force_ai_scan(background_tasks: BackgroundTasks):
     background_tasks.add_task(execute_full_ai_scan)
     return {"status": "success", "message": "Triggered immediate AI market prediction."}
 
+class TogglePayload(BaseModel):
+    is_running: bool
+
+@app.post("/api/toggle-bot")
+async def toggle_bot(payload: TogglePayload):
+    """Pause/resume the autonomous sentinel (safe kill switch — no funds moved)."""
+    scheduler_state["is_running"] = payload.is_running
+    return {"status": "success", "is_running": scheduler_state["is_running"]}
+
 @app.post("/api/panic-sell")
 async def panic_sell_all():
     """Emergency Flatten to Cash: Sells all active positions to USDT."""
-    positions = db.get_all_active_positions()
-    closed_items = []
-    is_paper = settings.PAPER_TRADING
-
-    for pos in positions:
-        sym = pos["symbol"]
-        qty = pos["quantity"]
-        curr_p = client.get_ticker_price(sym)
-
-        if not is_paper:
-            client.place_spot_order(sym, "SELL", qty, order_type="MARKET")
-
-        closed = db.close_active_position(sym, curr_p, "EMERGENCY_PANIC_SELL")
-        if is_paper and closed:
-            bal = db.get_paper_balance()
-            db.update_paper_balance(round(bal + (qty * curr_p), 2))
-        closed_items.append(sym)
-
-    return {"status": "success", "closed_positions": closed_items}
+    result = await asyncio.to_thread(engine.panic_sell_all)
+    return {
+        "status": "success" if not result["errors"] else "partial",
+        "closed_positions": result["closed_positions"],
+        "errors": result["errors"]
+    }
 
 if __name__ == "__main__":
     import uvicorn

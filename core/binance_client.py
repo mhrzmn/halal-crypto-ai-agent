@@ -156,6 +156,51 @@ class BinanceSpotClient:
         df.set_index("open_time", inplace=True)
         return df
 
+    @staticmethod
+    def extract_fill_price(order_response: Dict[str, Any], fallback_price: float) -> float:
+        """
+        Extract the real average execution price from a Binance order response.
+        MARKET orders include a `fills` array; falls back to `price`, then `fallback_price`.
+        """
+        try:
+            fills = order_response.get("fills") or []
+            if fills:
+                total_qty = sum(float(f["qty"]) for f in fills)
+                if total_qty > 0:
+                    return sum(float(f["price"]) * float(f["qty"]) for f in fills) / total_qty
+            price = float(order_response.get("price") or 0.0)
+            if price > 0:
+                return price
+        except (TypeError, ValueError, KeyError):
+            pass
+        return fallback_price
+
+    def get_exchange_filters(self, symbol: str) -> Dict[str, float]:
+        """
+        Fetch Binance trading rules for a symbol:
+        step_size (LOT_SIZE), min_qty, min_notional, tick_size.
+        """
+        res = self._request("GET", "/api/v3/exchangeInfo", params={"symbol": symbol.upper()})
+        info = (res.get("symbols") or [{}])[0]
+        filters = {f["filterType"]: f for f in info.get("filters", [])}
+        lot = filters.get("LOT_SIZE", {})
+        notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL", {})
+        price_f = filters.get("PRICE_FILTER", {})
+        return {
+            "step_size": float(lot.get("stepSize", 0.000001)),
+            "min_qty": float(lot.get("minQty", 0.0)),
+            "min_notional": float(notional.get("minNotional", 10.0)),
+            "tick_size": float(price_f.get("tickSize", 0.0001)),
+        }
+
+    def round_to_step(self, quantity: float, step_size: float) -> float:
+        """Round a quantity DOWN to the exchange step size (never oversell owned balance)."""
+        import math
+        if step_size <= 0:
+            return quantity
+        precision = max(0, round(-math.log10(step_size)))
+        return math.floor(quantity / step_size) * round(step_size, precision) if precision > 0 else math.floor(quantity / step_size) * step_size
+
     def get_spot_account_balance(self, asset: str = "USDT") -> float:
         """Fetch available Spot balance for an asset."""
         account_info = self._request("GET", "/api/v3/account", signed=True)

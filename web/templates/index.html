@@ -133,7 +133,17 @@
                     <svg class="w-4 h-4 text-emeraldgreen" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 12l3-3 3 3 4-4M8 21l4-4 4 4M3 4h18M4 4h16v12a1 1 0 01-1 1H5a1 1 0 01-1-1V4z"/></svg>
                     Live Equity Growth Curve
                 </h3>
-                <span class="text-xs text-gray-400">Auto-refreshing live</span>
+                <div class="flex items-center gap-2">
+                    <div class="flex rounded-lg overflow-hidden border border-gray-700" id="chartRangeSelector">
+                        <button data-range="1h" class="chart-range-btn px-2.5 py-1 text-[11px] font-bold text-gray-400 hover:text-white bg-gray-900 transition-colors">1H</button>
+                        <button data-range="6h" class="chart-range-btn px-2.5 py-1 text-[11px] font-bold text-gray-400 hover:text-white bg-gray-900 transition-colors">6H</button>
+                        <button data-range="24h" class="chart-range-btn px-2.5 py-1 text-[11px] font-bold text-gray-400 hover:text-white bg-gray-900 transition-colors">24H</button>
+                        <button data-range="7d" class="chart-range-btn px-2.5 py-1 text-[11px] font-bold text-gray-400 hover:text-white bg-gray-900 transition-colors">7D</button>
+                        <button data-range="30d" class="chart-range-btn px-2.5 py-1 text-[11px] font-bold text-gray-400 hover:text-white bg-gray-900 transition-colors">30D</button>
+                        <button data-range="all" class="chart-range-btn px-2.5 py-1 text-[11px] font-bold text-gray-400 hover:text-white bg-gray-900 transition-colors">ALL</button>
+                    </div>
+                    <span class="text-xs text-gray-400 hidden sm:inline">Auto-refreshing live</span>
+                </div>
             </div>
             <div class="h-64 relative">
                 <canvas id="equityChart"></canvas>
@@ -333,6 +343,20 @@
     <script>
         let equityChartInstance = null;
         let selectedResetBal = null;
+        let chartRange = '24h';
+
+        // Timeframe selector for the equity curve
+        function setChartRange(range) {
+            chartRange = range;
+            document.querySelectorAll('.chart-range-btn').forEach(btn => {
+                const active = btn.dataset.range === range;
+                btn.classList.toggle('bg-blue-600', active);
+                btn.classList.toggle('text-white', active);
+                btn.classList.toggle('bg-gray-900', !active);
+                btn.classList.toggle('text-gray-400', !active);
+            });
+            fetchChartData();
+        }
 
         function setDemoBal(amount) {
             selectedResetBal = amount;
@@ -453,6 +477,8 @@
                             <div>
                                 <span class="font-bold text-white text-sm">${p.symbol}</span>
                                 <span class="text-xs text-gray-400 ml-2">${p.quantity} units @ $${p.entry_price.toLocaleString()}</span>
+                                <span class="text-xs text-gray-500 ml-2">(invested: $${(p.entry_price * p.quantity).toFixed(2)})</span>
+                                <div class="text-[11px] mt-1">Live: <span class="font-semibold ${p.unrealized_pnl_pct >= 0 ? 'text-emeraldgreen' : 'text-crimsonred'}">$${p.current_price.toLocaleString()}</span></div>
                                 <div class="text-[11px] text-gray-400 mt-1">
                                     SL: <span class="text-crimsonred font-semibold">$${p.stop_loss}</span> | 
                                     TP: <span class="text-emeraldgreen font-semibold">$${p.take_profit}</span>
@@ -477,7 +503,7 @@
         // Fetch Live Chart Data
         async function fetchChartData() {
             try {
-                const res = await fetch('/api/chart-data');
+                const res = await fetch('/api/chart-data?range=' + chartRange);
                 const data = await res.json();
                 if (equityChartInstance && data.labels.length > 0) {
                     equityChartInstance.data.labels = data.labels;
@@ -499,8 +525,9 @@
                 if (data.trades.length === 0) {
                     tbody.innerHTML = '<tr><td colspan="6" class="py-4 text-center text-gray-500 italic">No closed trades yet.</td></tr>';
                 } else {
-                    tbody.innerHTML = data.trades.slice(0, 10).map(t => {
-                        const isWin = t.pnl_net_usdt > 0;
+                    tbody.innerHTML = data.trades.map(t => {
+                        const net = (t.pnl_net_usdt !== null && t.pnl_net_usdt !== 0) ? t.pnl_net_usdt : t.pnl_usdt;
+                        const isWin = net > 0;
                         return `
                             <tr>
                                 <td class="py-2 px-2 font-bold text-white">${t.symbol}</td>
@@ -508,7 +535,7 @@
                                 <td class="py-2 px-2 text-gray-400">$${t.sell_price.toLocaleString()}</td>
                                 <td class="py-2 px-2 text-yellow-400 font-mono">$${(t.fee_usdt || 0).toFixed(2)}</td>
                                 <td class="py-2 px-2 font-bold ${isWin ? 'text-emeraldgreen' : 'text-crimsonred'}">
-                                    ${t.pnl_net_usdt >= 0 ? '+$' : '-$'}${Math.abs(t.pnl_net_usdt || t.pnl_usdt).toFixed(2)}
+                                    ${net >= 0 ? '+$' : '-$'}${Math.abs(net).toFixed(2)}
                                 </td>
                                 <td class="py-2 px-2">
                                     <span class="px-2 py-0.5 text-[10px] font-bold rounded ${isWin ? 'bg-emerald-500/20 text-emerald-400' : 'bg-red-500/20 text-red-400'}">
@@ -612,8 +639,11 @@
         // Initialization & Auto-Polling
         window.onload = () => {
             initChart();
+            document.querySelectorAll('.chart-range-btn').forEach(btn => {
+                btn.addEventListener('click', () => setChartRange(btn.dataset.range));
+            });
+            setChartRange('24h');
             fetchStatus();
-            fetchChartData();
             fetchTrades();
             setInterval(fetchStatus, 3000);     // Update KPIs & timers every 3s
             setInterval(fetchChartData, 10000);  // Update chart every 10s

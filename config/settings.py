@@ -74,6 +74,20 @@ class AppSettings(BaseSettings):
         description="Minimum AI conviction score (0.0 to 1.0) required to execute an entry"
     )
 
+    # Anti-Churn Protection (stops fee-bleeding from rapid in/out trading)
+    MIN_HOLD_MINUTES: float = Field(
+        default=20.0,
+        description="Minimum minutes a position must be held before an AI/regime exit is allowed (SL/TP/trailing/panic always fire)"
+    )
+    AI_EXIT_MIN_EDGE_PERCENT: float = Field(
+        default=0.3,
+        description="AI exits are blocked unless the trade is losing more than this %% (cut losses) or gaining more than this %% (lock profit). Round-trip fees are ~0.2%%, so exits below this just donate fees."
+    )
+    SYMBOL_REENTRY_COOLDOWN_MINUTES: float = Field(
+        default=30.0,
+        description="Minutes to wait before re-buying a symbol that was just closed"
+    )
+
     # Storage
     DB_PATH: str = Field(default="storage/trades.db", description="SQLite database path")
 

@@ -5,7 +5,7 @@ Runs an autonomous AI analysis cycle and directly places trades with ZERO user i
 
 import sys
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ai_commander import AICommander
 from storage.database import Database
@@ -17,7 +17,7 @@ def run_ai_trading_turn():
 
     print("=" * 70)
     print("       ANTIGRAVITY AUTONOMOUS AI TRADING CYCLE (DIRECT EXECUTION)")
-    print(f"       Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')} | Zero Intervention Mode")
+    print(f"       Time: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')} | Zero Intervention Mode")
     print("=" * 70)
 
     cash = data["cash_balance_usdt"]
@@ -35,14 +35,24 @@ def run_ai_trading_turn():
         highest = pos["highest_price"]
         curr_price = commander.client.get_ticker_price(sym)
 
-        # Check exits
-        if curr_price <= sl:
-            print(f"[!] Stop-Loss Triggered for {sym}! Current: ${curr_price:,.2f} <= SL ${sl:,.2f}")
-            res = commander.execute_ai_order(sym, "SELL", f"Stop-Loss hit at ${curr_price:.2f}")
-            print(f"    Executed Exit: {res}")
-        elif curr_price >= tp:
-            print(f"[!] Take-Profit Triggered for {sym}! Current: ${curr_price:,.2f} >= TP ${tp:,.2f}")
-            res = commander.execute_ai_order(sym, "SELL", f"Take-Profit hit at ${curr_price:.2f}")
+        # Update high watermark so trailing stop works
+        if curr_price > highest:
+            commander.db.update_position_highest_price(sym, curr_price)
+            highest = curr_price
+
+        # Use the full RiskManager exit evaluation (SL / TP / trailing stop)
+        from risk.risk_manager import RiskManager
+        should_exit, exit_reason = RiskManager.evaluate_position_exit(
+            entry_price=entry,
+            current_price=curr_price,
+            stop_loss=sl,
+            take_profit=tp,
+            highest_price_seen=highest
+        )
+
+        if should_exit:
+            print(f"[!] Exit Triggered for {sym}: {exit_reason}")
+            res = commander.execute_ai_order(sym, "SELL", exit_reason)
             print(f"    Executed Exit: {res}")
         else:
             pnl_pct = ((curr_price - entry) / entry) * 100
@@ -74,8 +84,10 @@ def run_ai_trading_turn():
         
         last_candle = recent[-1]
         prev_candle = recent[-2] if len(recent) > 1 else last_candle
-        lower_shadow = min(last_candle["close"], snap["open"]) - last_candle["low"]
-        body = abs(last_candle["close"] - snap["open"])
+        # Use the candle's own open (consistent OHLC), not the snapshot's latest open
+        candle_open = last_candle.get("open", last_candle["close"])
+        lower_shadow = min(last_candle["close"], candle_open) - last_candle["low"]
+        body = abs(last_candle["close"] - candle_open)
         is_hammer_wick = lower_shadow > (body * 1.5) if body > 0 else False
         macd_curling_up = macd_hist > prev_macd_hist
 
