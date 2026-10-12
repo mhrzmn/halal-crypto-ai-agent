@@ -26,11 +26,14 @@ class BinanceSpotClient:
         self,
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
-        use_testnet: bool = False
+        use_testnet: Optional[bool] = None
     ):
         self.api_key = (api_key or settings.BINANCE_API_KEY or "").strip()
         self.api_secret = (api_secret or settings.BINANCE_API_SECRET or "").strip()
-        self.use_testnet = use_testnet or settings.BINANCE_USE_TESTNET
+        # Explicit True/False always wins over the .env flag; None defers to settings.
+        # (Previously `use_testnet or settings...` made it impossible to force LIVE
+        # market data while BINANCE_USE_TESTNET=true, which broke chart accuracy.)
+        self.use_testnet = settings.BINANCE_USE_TESTNET if use_testnet is None else use_testnet
         self.base_url = self.TESTNET_BASE_URL if self.use_testnet else self.LIVE_BASE_URL
         self.session = requests.Session()
         self.session.headers.update({
@@ -201,6 +204,25 @@ class BinanceSpotClient:
         precision = max(0, round(-math.log10(step_size)))
         return math.floor(quantity / step_size) * round(step_size, precision) if precision > 0 else math.floor(quantity / step_size) * step_size
 
+    @staticmethod
+    def round_to_tick(price: float, tick_size: float, direction: str = "nearest") -> float:
+        """
+        Round a price to the exchange tick size (PRICE_FILTER compliance).
+        direction: 'up' (ceiling), 'down' (floor), or 'nearest'.
+        """
+        import math
+        if tick_size <= 0:
+            return price
+        precision = max(0, round(-math.log10(tick_size)))
+        ratio = price / tick_size
+        if direction == "up":
+            rounded = math.ceil(ratio) * tick_size
+        elif direction == "down":
+            rounded = math.floor(ratio) * tick_size
+        else:
+            rounded = round(ratio) * tick_size
+        return round(rounded, precision)
+
     def get_spot_account_balance(self, asset: str = "USDT") -> float:
         """Fetch available Spot balance for an asset."""
         account_info = self._request("GET", "/api/v3/account", signed=True)
@@ -239,3 +261,50 @@ class BinanceSpotClient:
             params["timeInForce"] = "GTC"
 
         return self._request("POST", "/api/v3/order", params=params, signed=True)
+
+    # ------------------------------------------------------------------
+    # Exchange-side protection (Spot OCO: take-profit + stop-loss)
+    # ------------------------------------------------------------------
+    def place_spot_oco_sell(
+        self,
+        symbol: str,
+        quantity: float,
+        take_profit_price: float,
+        stop_price: float,
+        stop_limit_price: float
+    ) -> Dict[str, Any]:
+        """
+        Place an OCO order list that protects an existing LONG spot position:
+          - above: LIMIT_MAKER take-profit sell at take_profit_price
+          - below: STOP_LOSS_LIMIT sell triggering at stop_price, executing at stop_limit_price
+        Whichever leg fills first cancels the other, so the position carries
+        exchange-side protection even while this bot process is offline.
+
+        Uses the current Spot endpoint POST /api/v3/orderList/oco.
+        NOTE: verify on testnet (BINANCE_USE_TESTNET=true) before enabling in production.
+        """
+        ShariahComplianceGuard.audit_symbol(symbol)
+        ShariahComplianceGuard.audit_order_type(side="SELL", order_type="OCO", leverage=1.0)
+
+        params: Dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "side": "SELL",
+            "quantity": f"{quantity:.6f}".rstrip("0").rstrip("."),
+            "aboveType": "LIMIT_MAKER",
+            "abovePrice": f"{take_profit_price:.4f}",
+            "belowType": "STOP_LOSS_LIMIT",
+            "belowStopPrice": f"{stop_price:.4f}",
+            "belowPrice": f"{stop_limit_price:.4f}",
+            "belowTimeInForce": "GTC",
+        }
+        return self._request("POST", "/api/v3/orderList/oco", params=params, signed=True)
+
+    def cancel_order_list(self, symbol: str, order_list_id) -> Dict[str, Any]:
+        """Cancel an OCO order list (e.g. before a manual/panic sell frees the locked balance)."""
+        params = {"symbol": symbol.upper(), "orderListId": str(order_list_id)}
+        return self._request("DELETE", "/api/v3/orderList", params=params, signed=True)
+
+    def get_open_order_lists(self, symbol: Optional[str] = None) -> Any:
+        """Fetch open OCO order lists (for reconciliation after restarts)."""
+        params = {"symbol": symbol.upper()} if symbol else None
+        return self._request("GET", "/api/v3/openOrderList", params=params, signed=True)

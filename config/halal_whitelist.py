@@ -60,6 +60,13 @@ HALAL_WHITELIST: Dict[str, ShariahScreeningInfo] = {
         primary_utility="Layer-1 Subnet & Smart Contract Platform Utility",
         shariah_notes="Used for gas fees and subnet settlement. Permissible utility."
     ),
+    "XAUT": ShariahScreeningInfo(
+        symbol="XAUT",
+        name="Tether Gold",
+        status="HALAL",
+        primary_utility="Gold-Backed Asset Token (1 token = 1 troy oz allocated physical gold)",
+        shariah_notes="Fully backed by allocated physical gold in custody; spot purchase constitutes Bay' al-Sarf with immediate on-chain settlement into buyer custody. Treated as digital gold (Mal). No riba mechanism. Buyer should note counterparty/custody risk of the issuer."
+    ),
     "POL": ShariahScreeningInfo(
         symbol="POL",
         name="Polygon (formerly MATIC)",

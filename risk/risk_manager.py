@@ -108,12 +108,18 @@ class RiskManager:
             return True, f"TAKE_PROFIT_HIT: Price {current_price:.4f} hit TP {take_profit:.4f} (+{profit_pct:.2f}%)"
 
         # 3. Trailing Stop Logic (if price pumped > activation %, don't give back more than 1 ATR)
+        # STRICT_SL_TP_EXIT_ONLY: trailing stop is disabled as a sale trigger — routine
+        # positions close ONLY via the pre-committed SL/TP above.
+        if settings.STRICT_SL_TP_EXIT_ONLY:
+            return False, "HOLD"
+
         profit_ratio = (highest_price_seen - entry_price) / entry_price
         activation_ratio = settings.TRAILING_STOP_ACTIVATION_PERCENT / 100.0
-        
+
         if profit_ratio >= activation_ratio:
-            # Trailing stop trailed 1.5% below highest price seen
-            trailing_stop_level = highest_price_seen * 0.985
+            # Trailing stop trails TRAILING_STOP_DISTANCE_PERCENT below highest price seen
+            trail_dist = settings.TRAILING_STOP_DISTANCE_PERCENT / 100.0
+            trailing_stop_level = highest_price_seen * (1.0 - trail_dist)
             if current_price <= trailing_stop_level:
                 locked_profit_pct = ((current_price - entry_price) / entry_price) * 100.0
                 return True, f"TRAILING_STOP_HIT: Trailing stop triggered at {current_price:.4f} (Locked in +{locked_profit_pct:.2f}%)"

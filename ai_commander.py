@@ -36,7 +36,9 @@ class AICommander:
         for symbol in settings.TRADING_PAIRS:
             try:
                 ShariahComplianceGuard.audit_symbol(symbol)
-                df = self.client.get_klines(symbol, interval=settings.CANDLE_TIMEFRAME, limit=60)
+                df = self.client.get_klines(symbol, interval=settings.CANDLE_TIMEFRAME, limit=settings.CANDLE_LIMIT)
+                if settings.REQUIRE_CLOSED_CANDLE:
+                    df = IndicatorEngine.confirmed_candles(df)
                 df_calc = IndicatorEngine.calculate_all(df)
                 snapshot = IndicatorEngine.get_latest_snapshot(df_calc)
 
@@ -131,6 +133,20 @@ class AICommander:
             }
 
         elif action.upper() == "SELL":
+            # Strict exit policy: routine sells may only originate from the pre-committed
+            # stop-loss/take-profit (or an explicit emergency panic flatten). Any other
+            # AI-driven sell rationale is rejected so positions are never closed early.
+            if settings.STRICT_SL_TP_EXIT_ONLY:
+                allowed_prefixes = ("STOP_LOSS_HIT", "TAKE_PROFIT_HIT", "EMERGENCY_PANIC_SELL")
+                if not str(rationale).upper().startswith(allowed_prefixes):
+                    return {
+                        "success": False,
+                        "symbol": sym,
+                        "action": "SELL_REJECTED",
+                        "reason": "Strict SL/TP-only mode: routine positions close only via the "
+                                  "pre-committed stop-loss or take-profit."
+                    }
+
             pos = self.db.get_active_position(sym)
             if not pos:
                 return {

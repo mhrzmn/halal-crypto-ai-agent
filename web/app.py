@@ -33,6 +33,10 @@ templates = Jinja2Templates(directory="web/templates")
 # Global instances
 db = Database()
 client = BinanceSpotClient()
+# Market data for DISPLAY always comes from the real public Binance API,
+# even when BINANCE_USE_TESTNET=true (klines/ticker are public, no keys needed).
+# The trading `client` above still respects the testnet flag for order placement.
+market_client = BinanceSpotClient(use_testnet=False)
 predictor = AIPredictor()
 engine = BotEngine(binance_client=client, database=db)
 
@@ -94,7 +98,7 @@ async def run_sentinel_cycle():
 
         try:
             # Blocking HTTP call moved off the event loop
-            curr_price = await asyncio.to_thread(client.get_ticker_price, sym)
+            curr_price = await asyncio.to_thread(market_client.get_ticker_price, sym)
             invested_val += (curr_price * qty)
 
             if curr_price > highest:
@@ -134,27 +138,71 @@ async def run_sentinel_cycle():
 
 async def execute_full_ai_scan():
     """
-    Run one consolidated trading cycle through the shared BotEngine.
-    (Single source of truth - replaces the old duplicated scan/buy loop.)
+    Run one consolidated trading cycle through the shared BotEngine,
+    then generate and persist a fresh AI market prediction so the
+    dashboard "AI Prediction Brain" card always reflects the latest scan.
     """
     scheduler_state["active_scan_in_progress"] = True
     try:
         result = await asyncio.to_thread(engine.scan_and_execute_cycle)
 
-        # Adaptive timer: use shortest AI-suggested recheck, min 5 minutes
-        rechecks = [
-            p.get("next_recheck_minutes") for p in (result.get("pairs_scanned") or [])
-            if p.get("next_recheck_minutes")
-        ]
-        scheduler_state["next_recheck_minutes"] = max(5, min(rechecks)) if rechecks else 15
-        scheduler_state["last_ai_scan_timestamp"] = time.time()
-
         for action in result.get("actions_taken", []):
             print(f"[Engine Action]: {action.get('type')} {action.get('symbol')} ({action.get('reason', action.get('rationale', ''))})")
         for err in result.get("errors", []):
             print(f"[Engine Error]: {err}")
+
+        # Generate and persist a fresh forecast for EVERY scanned pair —
+        # the dashboard shows one Brain row per trading pair.
+        scanned = result.get("pairs_scanned") or []
+        symbols = [p["symbol"] for p in scanned] or list(settings.TRADING_PAIRS)
+        rechecks = []
+        for sym in symbols:
+            try:
+                recheck = await asyncio.to_thread(_generate_and_save_prediction, sym)
+                if recheck:
+                    rechecks.append(recheck)
+            except Exception as e:
+                print(f"[Prediction Error {sym}]: {e}")
+        if rechecks:
+            scheduler_state["next_recheck_minutes"] = max(5, min(60, min(rechecks)))
+
+        scheduler_state["last_ai_scan_timestamp"] = time.time()
     finally:
         scheduler_state["active_scan_in_progress"] = False
+
+
+def _generate_and_save_prediction(symbol: str) -> Optional[int]:
+    """Run AIPredictor on fresh candles and store the forecast in the DB."""
+    df = market_client.get_klines(symbol, interval=settings.CANDLE_TIMEFRAME, limit=settings.CANDLE_LIMIT)
+    df = BotEngine._signal_frame(df)
+    df_calc = IndicatorEngine.calculate_all(df)
+    snapshot = IndicatorEngine.get_latest_snapshot(df_calc)
+
+    pos = db.get_active_position(symbol)
+    prediction = predictor.predict_market_movement(
+        symbol=symbol,
+        df_candles=df,
+        snapshot=snapshot,
+        has_open_position=bool(pos),
+        entry_price=pos["entry_price"] if pos else None
+    )
+
+    action = "BUY" if prediction.predicted_direction in ("BULLISH_EXPANSION", "MEAN_REVERSION_BOUNCE") else \
+             ("SELL" if prediction.predicted_direction == "BEARISH_CONTINUATION" else "HOLD")
+
+    db.save_ai_prediction(
+        symbol=symbol,
+        predicted_direction=prediction.predicted_direction,
+        target_price=prediction.target_price,
+        invalidation_price=prediction.invalidation_price,
+        action=action,
+        confidence=prediction.confidence,
+        current_price=float(snapshot["close"]),
+        next_recheck_minutes=prediction.next_recheck_minutes,
+        thesis=prediction.thesis,
+        model_used=predictor.model_name
+    )
+    return prediction.next_recheck_minutes
 
 # -------------------------------------------------------------
 # REST API ENDPOINTS
@@ -177,7 +225,7 @@ async def get_dashboard_status():
     active_cards = []
     for p in positions:
         try:
-            curr_p = await asyncio.to_thread(client.get_ticker_price, p["symbol"])
+            curr_p = await asyncio.to_thread(market_client.get_ticker_price, p["symbol"])
             unrealized_pnl = (curr_p - p["entry_price"]) * p["quantity"]
             unrealized_pct = ((curr_p - p["entry_price"]) / p["entry_price"]) * 100.0
             invested_val += (curr_p * p["quantity"])
@@ -198,6 +246,8 @@ async def get_dashboard_status():
     total_equity = cash + invested_val
     perf = db.get_performance_summary()
     latest_pred = db.get_latest_ai_prediction()
+    pair_predictions = db.get_latest_predictions_per_symbol(list(settings.TRADING_PAIRS))
+    pending_entries = db.get_pending_entries()
 
     # Time remaining until next AI scan
     elapsed_seconds = time.time() - scheduler_state["last_ai_scan_timestamp"]
@@ -220,13 +270,54 @@ async def get_dashboard_status():
         "current_profit_pct": current_profit_pct,
         "performance": perf,
         "active_positions": active_cards,
+        "pending_entries": pending_entries,
         "latest_prediction": latest_pred,
+        "pair_predictions": pair_predictions,
         "next_recheck_seconds": remaining_seconds,
         "next_recheck_minutes": scheduler_state["next_recheck_minutes"],
         "is_running": scheduler_state["is_running"],
+        "scan_in_progress": scheduler_state["active_scan_in_progress"],
+        "last_scan_at": scheduler_state["last_ai_scan_timestamp"],
+        "trading_pairs": settings.TRADING_PAIRS,
         "custom_base_url": settings.CUSTOM_BASE_URL,
         "custom_model_name": settings.CUSTOM_MODEL_NAME
     }
+
+@app.get("/api/price-chart")
+async def get_price_chart(symbol: str = "BTCUSDT", interval: str = "15m", limit: int = 200):
+    """Return real exchange OHLC candles for the price chart (lightweight-charts)."""
+    symbol = (symbol or "BTCUSDT").upper()
+    if symbol not in settings.TRADING_PAIRS:
+        return JSONResponse(status_code=400, content={"error": f"Symbol {symbol} not in configured trading pairs"})
+
+    allowed_intervals = {"5m", "15m", "1h", "4h", "1d"}
+    if interval not in allowed_intervals:
+        interval = settings.CANDLE_TIMEFRAME if settings.CANDLE_TIMEFRAME in allowed_intervals else "15m"
+    limit = max(50, min(500, int(limit)))
+
+    df = await asyncio.to_thread(market_client.get_klines, symbol, interval, limit)
+    candles = []
+    for ts, row in df.iterrows():
+        candles.append({
+            "time": int(ts.timestamp()),
+            "open": round(float(row["open"]), 6),
+            "high": round(float(row["high"]), 6),
+            "low": round(float(row["low"]), 6),
+            "close": round(float(row["close"]), 6),
+            "volume": round(float(row["volume"]), 2)
+        })
+
+    # Overlay open position levels so the trader sees SL/TP against real price action
+    pos = db.get_active_position(symbol)
+    levels = None
+    if pos:
+        levels = {
+            "entry": pos["entry_price"],
+            "stop_loss": pos["stop_loss"],
+            "take_profit": pos["take_profit"]
+        }
+
+    return {"symbol": symbol, "interval": interval, "candles": candles, "position_levels": levels}
 
 # Supported chart timeframes: query param `range` -> hours of history (None = all)
 CHART_RANGES_HOURS = {
@@ -384,8 +475,11 @@ async def update_settings(payload: SettingsPayload):
 
 @app.post("/api/force-scan")
 async def force_ai_scan(background_tasks: BackgroundTasks):
-    """Force an immediate full AI prediction scan."""
+    """Force an immediate full AI prediction scan (no-op while one is running)."""
+    if scheduler_state["active_scan_in_progress"]:
+        return {"status": "busy", "message": "An AI scan is already in progress."}
     background_tasks.add_task(execute_full_ai_scan)
+    scheduler_state["active_scan_in_progress"] = True
     return {"status": "success", "message": "Triggered immediate AI market prediction."}
 
 class TogglePayload(BaseModel):

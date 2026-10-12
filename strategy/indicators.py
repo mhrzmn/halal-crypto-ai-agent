@@ -9,6 +9,28 @@ import pandas as pd
 
 class IndicatorEngine:
     @staticmethod
+    def confirmed_candles(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Return the frame without the still-forming last candle.
+        Binance returns the currently open kline as the final row; using it for
+        signals causes intra-bar flip-flops and premature entries. Requires the
+        `close_time` column produced by BinanceSpotClient.get_klines.
+        """
+        if df is None or df.empty:
+            return df
+        if "close_time" not in df.columns:
+            # No timing info available — be conservative and drop the last bar.
+            return df.iloc[:-1]
+        close_time = df["close_time"].iloc[-1]
+        if pd.isna(close_time):
+            return df.iloc[:-1]
+        now_utc = pd.Timestamp.utcnow().tz_localize(None)
+        close_time = pd.Timestamp(close_time).tz_localize(None) if pd.Timestamp(close_time).tzinfo else pd.Timestamp(close_time)
+        if close_time >= now_utc:
+            return df.iloc[:-1]
+        return df
+
+    @staticmethod
     def calculate_all(df: pd.DataFrame) -> pd.DataFrame:
         """Calculate technical indicators and append them to DataFrame."""
         data = df.copy()

@@ -78,6 +78,14 @@ Instead of a 15-minute coin flip, the bot uses a **Multi-Layered Quantitative + 
 
 ---
 
+## 3.1 Strict Swing-Trade Exit Policy (STRICT_SL_TP_EXIT_ONLY)
+
+The bot runs in **strict swing mode** by default:
+
+- **Entry**: high-conviction only (`AI_CONFIDENCE_THRESHOLD=0.80`), signals computed on **closed candles only** (`REQUIRE_CLOSED_CANDLE=true`), ≥2:1-style ATR reward:risk (2.5×/5.0× ATR), max 4 concurrent positions, 6h symbol re-entry cooldown.
+- **Exit**: routine positions close **only** via the pre-committed stop-loss or take-profit. Trailing stops and AI/regime exits are disabled as sale triggers. The AI may still *review* a thesis, but it cannot sell early. Emergency panic-sell remains available and is logged separately.
+- **Protection**: in live mode, set `PROTECT_WITH_EXCHANGE_OCO=true` (after testnet verification) to attach an exchange-side OCO (take-profit + stop-loss) to every position, so protection survives bot downtime. The engine cancels the OCO before manual/panic sells and reconciles the DB if the exchange filled it while offline.
+
 ## 4. Quick Start & CLI Usage
 
 ### Prerequisites

@@ -8,6 +8,7 @@ import json
 from datetime import datetime, timezone
 
 from ai_commander import AICommander
+from config.settings import settings
 from storage.database import Database
 
 def run_ai_trading_turn():
@@ -94,24 +95,41 @@ def run_ai_trading_turn():
         score = 0.0
         reasons = []
 
-        if regime in ["STRONG_BULLISH", "MODERATE_BULLISH"]:
-            score += 0.50
-            reasons.append("Bullish Trend Structure")
-        elif rsi < 25.0 and macd_curling_up:
-            score += 0.40
-            reasons.append(f"Deep Oversold capitulation (RSI {rsi:.1f}) with MACD curling up")
-            if is_hammer_wick:
-                score += 0.25
-                reasons.append("Bullish rejection hammer wick printed on 15m")
+        # Scoring mirrors strategy/signals.py exactly so both entry paths apply
+        # the same conviction standard and can actually reach the 0.80 threshold.
+        # Criterion A: Trend Structure (max 0.55)
+        if regime == "STRONG_BULLISH":
+            score += 0.55
+            reasons.append("Strong bullish structure (above 200 EMA, 20>50 EMA)")
+        elif regime == "MODERATE_BULLISH":
+            score += 0.35
+            reasons.append("Price above 200 EMA (Long-term Bullish structure)")
 
-        if snap["vol_ratio"] > 1.2:
+        # Criterion B: Healthy RSI (max 0.25)
+        if 42 <= rsi <= 65:
+            score += 0.25
+            reasons.append(f"RSI in optimal bullish accumulation zone ({rsi:.1f})")
+        elif rsi < 35 and regime in ["STRONG_BULLISH", "MODERATE_BULLISH"]:
+            score += 0.20
+            reasons.append(f"Oversold pullback in macro uptrend (RSI {rsi:.1f})")
+            if is_hammer_wick:
+                score += 0.05
+                reasons.append("Bullish rejection hammer wick")
+
+        # Criterion C: MACD Momentum Expansion (0.15)
+        if macd_hist > 0 and macd_curling_up:
             score += 0.15
-            reasons.append(f"Volume spike ({snap['vol_ratio']:.2f}x average)")
+            reasons.append("MACD histogram expanding upwards")
+
+        # Criterion D: Volume Confirmation (0.10)
+        if snap["vol_ratio"] > 1.1:
+            score += 0.10
+            reasons.append(f"Volume surge {snap['vol_ratio']:.2f}x average")
 
         print(f"  > {sym:<8}: ${price:>9,.2f} | RSI {rsi:>4.1f} | AI Conviction: {score:.2f} | Notes: {'; '.join(reasons) if reasons else 'No confluence'}")
 
-        # If conviction >= 0.65, mark as approved candidate
-        if score >= 0.65:
+        # Shared conviction threshold (same policy as the main engine — no bypasses)
+        if score >= settings.AI_CONFIDENCE_THRESHOLD:
             candidate_setups.append({
                 "symbol": sym,
                 "price": price,
@@ -129,8 +147,8 @@ def run_ai_trading_turn():
         price = best["price"]
         atr = best["atr"]
 
-        sl = round(price - (1.8 * atr), 4)
-        tp = round(price + (3.2 * atr), 4)
+        sl = round(price - (settings.ATR_STOP_LOSS_MULTIPLIER * atr), 4)
+        tp = round(price + (settings.ATR_TAKE_PROFIT_MULTIPLIER * atr), 4)
         rationale = f"AI Direct Approval: {best['reasons']} (Conviction {best['score']:.2f})"
 
         print(f"\n[+] AI DECISION: HIGH-CONVICTION OPPORTUNITY DETECTED ON {sym}!")
@@ -150,7 +168,7 @@ def run_ai_trading_turn():
         else:
             print(f"[!] Order rejected by risk manager: {order_res.get('reason')}")
     else:
-        print("\n[-] AI DECISION: HOLD 100% CASH. No setup reached the 0.65 conviction threshold.")
+        print(f"\n[-] AI DECISION: HOLD 100% CASH. No setup reached the {settings.AI_CONFIDENCE_THRESHOLD:.2f} conviction threshold.")
         print("    Capital preservation in effect. Waiting for market stabilization.")
 
     print("=" * 70)

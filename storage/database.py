@@ -74,11 +74,12 @@ class Database:
                     entry_price REAL NOT NULL,
                     stop_loss REAL NOT NULL,
                     take_profit REAL NOT NULL,
-                    highest_price REAL NOT NULL,
-                    entry_time TEXT NOT NULL,
-                    is_paper INTEGER NOT NULL
-                )
-            """)
+                highest_price REAL NOT NULL,
+                entry_time TEXT NOT NULL,
+                is_paper INTEGER NOT NULL,
+                protection_order_id TEXT
+            )
+        """)
 
             # 3. Trade History Table with Fee Tracking
             cursor.execute("""
@@ -142,7 +143,26 @@ class Database:
                 )
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS pending_entries (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    symbol TEXT NOT NULL,
+                    target_entry REAL NOT NULL,
+                    stop_loss REAL NOT NULL,
+                    take_profit REAL NOT NULL,
+                    confidence REAL NOT NULL,
+                    rationale TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                )
+            """)
+
             # --- Schema migrations for databases created by older versions ---
+            pos_cols = {c[1] for c in cursor.execute("PRAGMA table_info(active_positions)")}
+            if "protection_order_id" not in pos_cols:
+                cursor.execute("ALTER TABLE active_positions ADD COLUMN protection_order_id TEXT")
+
             trade_cols = {c[1] for c in cursor.execute("PRAGMA table_info(trade_history)")}
             if "fee_usdt" not in trade_cols:
                 cursor.execute("ALTER TABLE trade_history ADD COLUMN fee_usdt REAL NOT NULL DEFAULT 0.0")
@@ -359,6 +379,16 @@ class Database:
             ))
             conn.commit()
 
+    def set_protection_order_id(self, symbol: str, order_list_id: Optional[str]) -> None:
+        """Record the exchange-side OCO order list protecting this position (live mode)."""
+        with self._write_lock, self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE active_positions SET protection_order_id = ? WHERE symbol = ?",
+                (str(order_list_id) if order_list_id is not None else None, symbol.upper())
+            )
+            conn.commit()
+
     def update_position_highest_price(self, symbol: str, highest_price: float) -> None:
         """Update high watermark for trailing stop calculations."""
         with self._get_connection() as conn:
@@ -534,6 +564,69 @@ class Database:
             cursor.execute("SELECT * FROM ai_predictions ORDER BY id DESC LIMIT 1")
             row = cursor.fetchone()
             return dict(row) if row else None
+
+    # ---------------- Pending (limit-zone) entries ----------------
+
+    def save_pending_entry(
+        self,
+        symbol: str,
+        target_entry: float,
+        stop_loss: float,
+        take_profit: float,
+        confidence: float,
+        rationale: str,
+        expires_at: str,
+    ) -> int:
+        """Queue an AI-approved entry that waits for price to reach the target zone."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO pending_entries
+                (symbol, target_entry, stop_loss, take_profit, confidence, rationale, status, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?, ?)
+            """, (symbol, target_entry, stop_loss, take_profit, confidence, rationale,
+                  datetime.now(timezone.utc).isoformat(), expires_at))
+            return cursor.lastrowid
+
+    def get_pending_entries(self, status: str = "PENDING") -> List[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM pending_entries WHERE status = ? ORDER BY id ASC", (status,)
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    def get_pending_entry_for_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM pending_entries WHERE symbol = ? AND status = 'PENDING' "
+                "ORDER BY id DESC LIMIT 1", (symbol,)
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def update_pending_entry_status(self, entry_id: int, status: str) -> None:
+        """status: FILLED | CANCELLED | EXPIRED"""
+        with self._get_connection() as conn:
+            conn.execute(
+                "UPDATE pending_entries SET status = ? WHERE id = ?", (status, entry_id)
+            )
+
+    def get_latest_predictions_per_symbol(self, symbols: List[str]) -> List[Dict[str, Any]]:
+        """Fetch the most recent prediction for each given symbol."""
+        results = []
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            for sym in symbols:
+                cursor.execute(
+                    "SELECT * FROM ai_predictions WHERE symbol = ? ORDER BY id DESC LIMIT 1",
+                    (sym,),
+                )
+                row = cursor.fetchone()
+                if row:
+                    results.append(dict(row))
+        return results
 
     def get_recent_ai_predictions(self, limit: int = 10) -> List[Dict[str, Any]]:
         """Fetch recent AI predictions."""

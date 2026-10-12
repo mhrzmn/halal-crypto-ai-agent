@@ -6,6 +6,7 @@ import unittest
 import pandas as pd
 import numpy as np
 
+from config.settings import settings
 from config.halal_whitelist import is_pair_halal, is_asset_halal, HARAM_BLACKLIST
 from core.shariah_guard import ShariahComplianceGuard, ShariahViolationError
 from strategy.indicators import IndicatorEngine
@@ -98,6 +99,71 @@ class TestRiskManagement(unittest.TestCase):
         )
         self.assertTrue(should_exit)
         self.assertIn("STOP_LOSS_HIT", reason)
+
+class TestStrictExitPolicy(unittest.TestCase):
+    """Strict SL/TP-only mode: trailing stops and AI exits must never close a position early."""
+
+    def setUp(self):
+        self._prev = settings.STRICT_SL_TP_EXIT_ONLY
+        settings.STRICT_SL_TP_EXIT_ONLY = True
+
+    def tearDown(self):
+        settings.STRICT_SL_TP_EXIT_ONLY = self._prev
+
+    def test_trailing_stop_disabled_in_strict_mode(self):
+        # Price pumped 10% (well past trailing activation) then pulled back 3%.
+        # In strict mode this must NOT exit — only SL/TP may close.
+        should_exit, reason = RiskManager.evaluate_position_exit(
+            entry_price=100.0,
+            current_price=107.0,
+            stop_loss=95.0,
+            take_profit=120.0,
+            highest_price_seen=110.0
+        )
+        self.assertFalse(should_exit)
+        self.assertEqual(reason, "HOLD")
+
+    def test_sl_tp_still_fire_in_strict_mode(self):
+        sl_exit, _ = RiskManager.evaluate_position_exit(100.0, 94.0, 95.0, 120.0, 100.0)
+        tp_exit, _ = RiskManager.evaluate_position_exit(100.0, 121.0, 95.0, 120.0, 121.0)
+        self.assertTrue(sl_exit)
+        self.assertTrue(tp_exit)
+
+    def test_ai_exit_blocked_in_strict_mode(self):
+        from execution.bot_engine import BotEngine
+        allowed, reason = BotEngine._ai_exit_allowed(100.0, 110.0, "2026-10-01T00:00:00+00:00")
+        self.assertFalse(allowed)
+        self.assertIn("strict", reason.lower())
+
+    def test_ai_exit_fails_closed_on_bad_timestamp(self):
+        settings.STRICT_SL_TP_EXIT_ONLY = False
+        from execution.bot_engine import BotEngine
+        allowed, reason = BotEngine._ai_exit_allowed(100.0, 110.0, "not-a-timestamp")
+        self.assertFalse(allowed)
+        self.assertIn("fail-closed", reason)
+
+class TestConfirmedCandles(unittest.TestCase):
+    def test_forming_last_candle_is_dropped(self):
+        import pandas as pd
+        now = pd.Timestamp.utcnow().tz_localize(None)
+        df = pd.DataFrame({
+            "open": [1.0, 2.0], "high": [1.0, 2.0], "low": [1.0, 2.0],
+            "close": [1.0, 2.0], "volume": [1.0, 1.0],
+            "close_time": [now - pd.Timedelta(hours=8), now + pd.Timedelta(hours=3)]
+        })
+        confirmed = IndicatorEngine.confirmed_candles(df)
+        self.assertEqual(len(confirmed), 1)
+
+    def test_closed_last_candle_is_kept(self):
+        import pandas as pd
+        now = pd.Timestamp.utcnow().tz_localize(None)
+        df = pd.DataFrame({
+            "open": [1.0, 2.0], "high": [1.0, 2.0], "low": [1.0, 2.0],
+            "close": [1.0, 2.0], "volume": [1.0, 1.0],
+            "close_time": [now - pd.Timedelta(hours=8), now - pd.Timedelta(hours=1)]
+        })
+        confirmed = IndicatorEngine.confirmed_candles(df)
+        self.assertEqual(len(confirmed), 2)
 
 class TestDatabase(unittest.TestCase):
     def test_paper_trade_lifecycle(self):
