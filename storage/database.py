@@ -154,9 +154,18 @@ class Database:
                     rationale TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'PENDING',
                     created_at TEXT NOT NULL,
-                    expires_at TEXT NOT NULL
+                    expires_at TEXT NOT NULL,
+                    amend_count INTEGER NOT NULL DEFAULT 0,
+                    amend_log TEXT NOT NULL DEFAULT ''
                 )
             """)
+
+            # --- Schema migrations for databases created by older versions ---
+            pend_cols = {c[1] for c in cursor.execute("PRAGMA table_info(pending_entries)")}
+            if "amend_count" not in pend_cols:
+                cursor.execute("ALTER TABLE pending_entries ADD COLUMN amend_count INTEGER NOT NULL DEFAULT 0")
+            if "amend_log" not in pend_cols:
+                cursor.execute("ALTER TABLE pending_entries ADD COLUMN amend_log TEXT NOT NULL DEFAULT ''")
 
             # --- Schema migrations for databases created by older versions ---
             pos_cols = {c[1] for c in cursor.execute("PRAGMA table_info(active_positions)")}
@@ -613,6 +622,44 @@ class Database:
                 "UPDATE pending_entries SET status = ? WHERE id = ?", (status, entry_id)
             )
 
+    def amend_pending_entry(
+        self,
+        entry_id: int,
+        target_entry: float,
+        stop_loss: float,
+        take_profit: float,
+        confidence: float,
+        rationale: str,
+        expires_at: str,
+        note: str,
+    ) -> None:
+        """
+        Update a waiting pending order's zone/levels after fresh AI analysis.
+        Appends an audit line (timestamp, old→new zone, reason) to amend_log
+        and increments amend_count.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            row = cursor.execute(
+                "SELECT target_entry, amend_count, amend_log FROM pending_entries WHERE id = ?",
+                (entry_id,)
+            ).fetchone()
+            if not row:
+                return
+            ts = datetime.now(timezone.utc).isoformat()
+            line = (
+                f"[{ts}] zone {row['target_entry']:.6f} -> {target_entry:.6f} | {note}\n"
+            )
+            cursor.execute("""
+                UPDATE pending_entries
+                SET target_entry = ?, stop_loss = ?, take_profit = ?,
+                    confidence = ?, rationale = ?, expires_at = ?,
+                    amend_count = amend_count + 1,
+                    amend_log = ? || ?
+                WHERE id = ?
+            """, (target_entry, stop_loss, take_profit, confidence, rationale,
+                  expires_at, row["amend_log"], line, entry_id))
+
     def get_latest_predictions_per_symbol(self, symbols: List[str]) -> List[Dict[str, Any]]:
         """Fetch the most recent prediction for each given symbol."""
         results = []
@@ -634,6 +681,27 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM ai_predictions ORDER BY id DESC LIMIT ?", (limit,))
             return [dict(r) for r in cursor.fetchall()]
+
+    def get_mean_reversion_context(self) -> Dict[str, Any]:
+        """(placeholder for future analytics)"""
+        return {}
+
+    def get_equity_series(self, limit: int = 1000) -> List[float]:
+        """
+        Return the ordered (oldest -> newest) total_equity series for drawdown
+        and circuit-breaker calculations.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT total_equity FROM portfolio_snapshots ORDER BY id DESC LIMIT ?",
+                (limit,)
+            )
+            rows = [float(r["total_equity"]) for r in cursor.fetchall()]
+            rows.reverse()
+            return rows
+
+    # ---------------- Kill switch state persistence ----------------
 
     def get_last_close_time(self, symbol: str) -> Optional[datetime]:
         """Return the most recent exit time for a symbol (any trade), or None."""

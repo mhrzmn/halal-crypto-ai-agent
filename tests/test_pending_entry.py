@@ -137,5 +137,79 @@ class TestPendingEntries(unittest.TestCase):
         self.assertEqual(len(self.db.get_pending_entries(status="EXPIRED")), 1)
 
 
+class TestPendingEntryAmendments(unittest.TestCase):
+    """AI amendment of a waiting pending order (direction-safe rules)."""
+
+    def setUp(self):
+        self.tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.tmp.close()
+        self.db = Database(db_path=self.tmp.name)
+        self.client = FakeClient(price=100.0)
+        self.engine = BotEngine(binance_client=self.client, database=self.db)
+        self.engine.is_paper = True
+        self.db.update_paper_balance(10_000.0)
+        # Seed one order: zone 97, SL 89, TP 117 (close 100, atr 4, ema20 99)
+        self.engine._queue_pending_entry("BTCUSDT", make_snapshot(), make_assessment())
+        self.pending = self.db.get_pending_entries()[0]
+
+    def tearDown(self):
+        try:
+            os.unlink(self.tmp.name)
+        except PermissionError:
+            pass
+
+    def test_amend_downward_allowed(self):
+        # Market fell: close 94, atr 4, ema20 95 -> new zone = min(95, 94-3=91) = 91 (< 97)
+        snap = make_snapshot(close=94.0, atr=4.0, ema20=95.0)
+        res = self.engine._maybe_amend_pending_entry(self.pending, snap, make_assessment())
+        self.assertIsNotNone(res)
+        self.assertEqual(res["type"], "PENDING_ENTRY_AMENDED")
+        self.assertAlmostEqual(res["target_entry"], 91.0, places=4)
+        row = self.db.get_pending_entries()[0]
+        self.assertAlmostEqual(row["target_entry"], 91.0, places=4)
+        self.assertEqual(row["amend_count"], 1)
+        self.assertIn("lowered", row["amend_log"])
+
+    def test_amend_upward_blocked_when_stop_loosens(self):
+        # Market rose: close 104, atr 4, ema20 105 -> new zone = min(105, 104-3=101) = 101 (> 97)
+        # new SL = 92 - (104-101) = 89 -> equals old SL 89... use assessment SL 90 -> new SL 87 < 89 (looser)
+        snap = make_snapshot(close=104.0, atr=4.0, ema20=105.0)
+        res = self.engine._maybe_amend_pending_entry(
+            self.pending, snap, make_assessment(sl=90.0)
+        )
+        self.assertIsNone(res)
+        row = self.db.get_pending_entries()[0]
+        self.assertAlmostEqual(row["target_entry"], 97.0, places=4)
+        self.assertEqual(row["amend_count"], 0)
+
+    def test_amend_upward_allowed_when_stop_tightened(self):
+        # Same upward zone (101) but assessment SL 95 -> new SL = 95-3 = 92 >= old 89 (tighter)
+        snap = make_snapshot(close=104.0, atr=4.0, ema20=105.0)
+        res = self.engine._maybe_amend_pending_entry(
+            self.pending, snap, make_assessment(sl=95.0, tp=125.0)
+        )
+        self.assertIsNotNone(res)
+        self.assertAlmostEqual(res["target_entry"], 101.0, places=4)
+        self.assertAlmostEqual(res["stop_loss"], 92.0, places=4)
+        row = self.db.get_pending_entries()[0]
+        self.assertIn("raised (stop tightened)", row["amend_log"])
+
+    def test_amend_ignores_tiny_moves(self):
+        # close 100.5, atr 4, ema20 99 -> zone = min(99, 100.5-3=97.5) = 97.5; |97.5-97| = 0.5 < 0.25*4=1.0
+        snap = make_snapshot(close=100.5, atr=4.0, ema20=99.0)
+        res = self.engine._maybe_amend_pending_entry(self.pending, snap, make_assessment())
+        self.assertIsNone(res)
+
+    def test_amend_cap_enforced(self):
+        with self.db._get_connection() as conn:
+            conn.execute("UPDATE pending_entries SET amend_count = 3 WHERE id = ?",
+                         (self.pending["id"],))
+        pending = self.db.get_pending_entries()[0]
+        snap = make_snapshot(close=94.0, atr=4.0, ema20=95.0)
+        res = self.engine._maybe_amend_pending_entry(pending, snap, make_assessment())
+        self.assertIsNone(res)
+        self.assertEqual(self.db.get_pending_entries()[0]["amend_count"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

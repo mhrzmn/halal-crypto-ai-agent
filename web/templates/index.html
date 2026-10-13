@@ -615,7 +615,7 @@
                         <span class="text-gray-500">TP <span class="text-up">${fmtUsd(e.take_profit, dec)}</span></span>
                     </div>
                     <div class="flex justify-between mt-1.5 text-[10px] text-gray-500">
-                        <span>conviction ${Math.round((e.confidence || 0) * 100)}%</span>
+                        <span>conviction ${Math.round((e.confidence || 0) * 100)}%${e.amend_count ? ` · <span class="text-accent" title="${(e.amend_log || '').replace(/"/g, '&quot;')}">amended ×${e.amend_count}</span>` : ''}</span>
                         <span>expires ${expiry} UTC</span>
                     </div>
                 </div>`;

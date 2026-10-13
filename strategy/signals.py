@@ -94,6 +94,45 @@ class SignalGenerator:
         score = 0.0
         reasons = []
 
+        # Criterion 0: Regime Quality Gate (chop filter)
+        # Empirically validated (5-pair 4h backtest): the +DI > -DI directional
+        # gate is the strongest single filter and is ON by default. Hard ADX and
+        # Choppiness gates are available but OFF by default because they cut
+        # aggregate edge on this universe (see config/settings.py notes).
+        if settings.REGIME_FILTER_ENABLED:
+            adx = snapshot.get("adx_14", 0.0)
+            chop = snapshot.get("chop_14", 50.0)
+            di_plus = snapshot.get("di_plus", 0.0)
+            di_minus = snapshot.get("di_minus", 0.0)
+            if settings.REQUIRE_ADX_FILTER and adx < settings.ADX_TREND_THRESHOLD:
+                return TradeSignal(
+                    symbol=symbol, action="HOLD", confidence=round(score, 2),
+                    current_price=close, stop_loss=sl_price, take_profit=tp_price,
+                    risk_reward_ratio=rr_ratio,
+                    rationale=f"Regime filter: ADX {adx:.1f} < {settings.ADX_TREND_THRESHOLD} "
+                              f"(non-trending/chop) — no entry.",
+                    regime=regime
+                )
+            if settings.REQUIRE_CHOP_FILTER and chop > settings.CHOP_MAX_THRESHOLD:
+                return TradeSignal(
+                    symbol=symbol, action="HOLD", confidence=round(score, 2),
+                    current_price=close, stop_loss=sl_price, take_profit=tp_price,
+                    risk_reward_ratio=rr_ratio,
+                    rationale=f"Regime filter: Choppiness {chop:.1f} > {settings.CHOP_MAX_THRESHOLD} "
+                              f"(consolidation) — no entry.",
+                    regime=regime
+                )
+            if settings.REQUIRE_DI_ALIGNMENT and di_plus <= di_minus:
+                return TradeSignal(
+                    symbol=symbol, action="HOLD", confidence=round(score, 2),
+                    current_price=close, stop_loss=sl_price, take_profit=tp_price,
+                    risk_reward_ratio=rr_ratio,
+                    rationale=f"Regime filter: +DI {di_plus:.1f} <= -DI {di_minus:.1f} "
+                              f"(no bullish directional bias) — no entry.",
+                    regime=regime
+                )
+            reasons.append(f"Regime OK (ADX {adx:.1f}, CHOP {chop:.1f}, +DI>-DI)")
+
         # Criterion A: Trend Structure
         if close > ema_200:
             score += 0.35
@@ -119,6 +158,11 @@ class SignalGenerator:
         if vol_ratio > 1.1:
             score += 0.10
             reasons.append(f"Volume surge {vol_ratio:.2f}x above average")
+
+        # Do not add a discretionary "strong-trend bonus" to the score. The
+        # regime layer is intentionally a gate only; adding points here can turn
+        # marginal setups into trades and overfit the threshold. Strong ADX is
+        # already captured by passing the gate.
 
         if score >= settings.AI_CONFIDENCE_THRESHOLD:
             return TradeSignal(

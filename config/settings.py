@@ -79,6 +79,16 @@ class AppSettings(BaseSettings):
         default=0.75,
         description="How deep below the signal close the entry zone sits, in ATR multiples"
     )
+    PENDING_ENTRY_AMEND_ENABLED: bool = Field(
+        default=True,
+        description="Allow the AI to amend a waiting pending entry's zone on fresh analysis "
+                    "(direction-safe: downward moves always allowed; upward moves only if the "
+                    "stop is not loosened)."
+    )
+    PENDING_ENTRY_MAX_AMENDMENTS: int = Field(
+        default=3,
+        description="Max number of times a single pending order may be amended before it is left to fill/expire."
+    )
     PENDING_ENTRY_EXPIRY_HOURS: int = Field(
         default=48,
         description="Cancel a pending entry if price never reaches the zone within this window"
@@ -139,6 +149,129 @@ class AppSettings(BaseSettings):
     SYMBOL_REENTRY_COOLDOWN_MINUTES: float = Field(
         default=360.0,
         description="Minutes to wait before re-buying a symbol that was just closed"
+    )
+
+    # ------------------------------------------------------------------
+    # Regime Quality Filter (avoid trading in chop — the #1 whipsaw killer)
+    # Only enter when the tape has genuine directional energy (ADX up,
+    # Choppiness down). Both conditions must be met to allow an entry.
+    # ------------------------------------------------------------------
+    REGIME_FILTER_ENABLED: bool = Field(
+        default=True,
+        description="Block new entries when the market is non-trending (low ADX / high Choppiness)"
+    )
+    # Self-critique / out-of-sample finding (2026-10-13, 5-pair 4h ~1000-bar
+    # Binance history, fees included, next-bar fills):
+    #   full ADX+CHOP gate  -> reduced aggregate return
+    #   +DI>-DI gate alone  -> NEARUT 8.1->3.8, ADA 2.3->5.2, LINK 5.9->6.7,
+    #                          BTC 2.4->2.5, AVAX neutral; TOTAL 23.4->22.9
+    # Net: the gate improves 3 of 5 pairs and lowers drawdown but slightly
+    # reduces headline return. It is therefore kept AVAILABLE but OFF by default;
+    # enable REQUIRE_DI_ALIGNMENT for a more conservative, lower-variance profile.
+    REGIME_FILTER_ENABLED: bool = Field(
+        default=True,
+        description="Master switch for regime-quality entry gating"
+    )
+    REQUIRE_ADX_FILTER: bool = Field(
+        default=False,
+        description="Require ADX above threshold as a hard entry gate (off: reduced aggregate edge)"
+    )
+    ADX_TREND_THRESHOLD: float = Field(
+        default=20.0,
+        description="Minimum ADX(14) when REQUIRE_ADX_FILTER is enabled"
+    )
+    ADX_STRONG_TREND: float = Field(
+        default=30.0,
+        description="ADX(14) level used for observability (not a score bonus)"
+    )
+    REQUIRE_CHOP_FILTER: bool = Field(
+        default=False,
+        description="Require Choppiness below threshold as a hard entry gate (off: reduced aggregate edge)"
+    )
+    CHOP_MAX_THRESHOLD: float = Field(
+        default=61.8,
+        description="Choppiness Index ceiling when REQUIRE_CHOP_FILTER is enabled"
+    )
+    REQUIRE_DI_ALIGNMENT: bool = Field(
+        default=False,
+        description="Require +DI > -DI (bullish directional bias) for entries. Lower-variance but "
+                    "marginally lower return on the tested universe; enable for a defensive profile."
+    )
+
+    # ------------------------------------------------------------------
+    # Portfolio-Level Risk (correlation / heat / total exposure)
+    # ------------------------------------------------------------------
+    MAX_TOTAL_EXPOSURE_PERCENT: float = Field(
+        default=70.0,
+        description="Hard cap on total deployed capital as %% of equity (keeps dry powder for drawdowns)"
+    )
+    MAX_PORTFOLIO_HEAT_PERCENT: float = Field(
+        default=6.0,
+        description="Max aggregate open risk (sum of per-trade risk) as %% of equity"
+    )
+    MAX_CORRELATED_EXPOSURE_PERCENT: float = Field(
+        default=40.0,
+        description="Max capital (%% of equity) allowed in concurrently-held assets that move together"
+    )
+    CORRELATION_THRESHOLD: float = Field(
+        default=0.7,
+        description="Correlation above which two assets are treated as one concentrated bet"
+    )
+    CORRELATION_LOOKBACK_CANDLES: int = Field(
+        default=120,
+        description="Number of candles used to estimate pairwise return correlation for the correlation guard"
+    )
+
+    # ------------------------------------------------------------------
+    # Drawdown Circuit Breaker / Kill Switch (equity high-water-mark based)
+    # Tiered de-risking, then a full halt requiring manual re-arm.
+    # ------------------------------------------------------------------
+    DRAWDOWN_BREAKER_ENABLED: bool = Field(
+        default=True,
+        description="Enable equity-curve drawdown circuit breakers (like institutional bots)"
+    )
+    DRAWDOWN_REDUCE_HALF_PERCENT: float = Field(
+        default=5.0,
+        description="Drawdown from equity high-water mark at which new position sizes are halved"
+    )
+    DRAWDOWN_REDUCE_QUARTER_PERCENT: float = Field(
+        default=10.0,
+        description="Drawdown at which new position sizes are cut to a quarter"
+    )
+    DRAWDOWN_HALT_PERCENT: float = Field(
+        default=15.0,
+        description="Drawdown at which all new entries halt until manually re-armed (kill switch)"
+    )
+    KILL_SWITCH_ARMED_FILE: str = Field(
+        default="storage/kill_switch.state",
+        description="State file recording whether the kill switch is armed (halted) or cleared"
+    )
+
+    # ------------------------------------------------------------------
+    # Volatility-Targeted Sizing & Time Stops
+    # ------------------------------------------------------------------
+    VOL_TARGET_SIZING_ENABLED: bool = Field(
+        default=True,
+        description="Scale position size inversely with realized volatility (calmer tape = larger size)"
+    )
+    TARGET_VOL_PERCENT_PER_BAR: float = Field(
+        default=1.5,
+        description="Target per-bar realized vol %% used as the volatility-sizing reference"
+    )
+    VOL_SCALE_MIN: float = Field(
+        default=0.5, description="Lower clamp on the volatility size multiplier"
+    )
+    VOL_SCALE_MAX: float = Field(
+        default=1.5, description="Upper clamp on the volatility size multiplier"
+    )
+    CONFIDENCE_SIZE_SCALING_ENABLED: bool = Field(
+        default=True,
+        description="Scale position size with signal confidence (higher conviction = larger size)"
+    )
+    MAX_HOLD_HOURS: float = Field(
+        default=0.0,
+        description="Time-based exit: close a position after this many hours even without SL/TP. "
+                    "0 disables. Swing default 0; set e.g. 168 (7d) to recycle dead capital."
     )
 
     # Storage

@@ -7,6 +7,8 @@ from typing import Dict, Any
 import numpy as np
 import pandas as pd
 
+from config.settings import settings
+
 class IndicatorEngine:
     @staticmethod
     def confirmed_candles(df: pd.DataFrame) -> pd.DataFrame:
@@ -24,7 +26,7 @@ class IndicatorEngine:
         close_time = df["close_time"].iloc[-1]
         if pd.isna(close_time):
             return df.iloc[:-1]
-        now_utc = pd.Timestamp.utcnow().tz_localize(None)
+        now_utc = pd.Timestamp.now(tz="UTC").tz_localize(None)
         close_time = pd.Timestamp(close_time).tz_localize(None) if pd.Timestamp(close_time).tzinfo else pd.Timestamp(close_time)
         if close_time >= now_utc:
             return df.iloc[:-1]
@@ -71,6 +73,38 @@ class IndicatorEngine:
         data["vol_ma_20"] = data["volume"].rolling(window=20).mean()
         data["vol_ratio"] = data["volume"] / (data["vol_ma_20"] + 1e-9)
 
+        # --------------------------------------------------------------
+        # ADX (14) + Directional Movement — trend STRENGTH filter.
+        # The single most cited chop filter: ADX < 20-25 => non-trending,
+        # trend-following entries there are the #1 source of whipsaw losses.
+        # --------------------------------------------------------------
+        adx_period = 14
+        up_move = data["high"].diff()
+        down_move = -data["low"].diff()
+        plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+        minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+        # Wilder's smoothing (equivalent to an EWM with alpha = 1/period)
+        tr_wilder = tr.ewm(alpha=1.0 / adx_period, adjust=False).mean()
+        plus_di = 100 * (pd.Series(plus_dm, index=data.index).ewm(alpha=1.0 / adx_period, adjust=False).mean() / (tr_wilder + 1e-9))
+        minus_di = 100 * (pd.Series(minus_dm, index=data.index).ewm(alpha=1.0 / adx_period, adjust=False).mean() / (tr_wilder + 1e-9))
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)
+        data["di_plus"] = plus_di
+        data["di_minus"] = minus_di
+        data["adx_14"] = dx.ewm(alpha=1.0 / adx_period, adjust=False).mean()
+
+        # Choppiness Index (14): >61.8 = consolidating/chop, <38.2 = trending.
+        # Complements ADX by measuring how much price "wanders" vs. travels.
+        chop_period = 14
+        atr_sum = tr.rolling(window=chop_period).sum()
+        hh = data["high"].rolling(window=chop_period).max()
+        ll = data["low"].rolling(window=chop_period).min()
+        data["chop_14"] = 100 * np.log10(atr_sum / ((hh - ll) + 1e-9)) / np.log10(chop_period)
+
+        # Realized volatility (annualization-agnostic, per-bar %): used by
+        # volatility-targeted position sizing (vol regime -> size scaling).
+        log_ret = np.log(data["close"] / data["close"].shift(1))
+        data["realized_vol_20"] = log_ret.rolling(window=20).std()
+
         return data
 
     @staticmethod
@@ -86,6 +120,23 @@ class IndicatorEngine:
         rsi = float(latest["rsi_14"]) if not np.isnan(latest["rsi_14"]) else 50.0
         atr = float(latest["atr_14"]) if not np.isnan(latest["atr_14"]) else (close * 0.01)
         vol_ratio = float(latest["vol_ratio"]) if not np.isnan(latest["vol_ratio"]) else 1.0
+        adx = float(latest["adx_14"]) if "adx_14" in latest and not np.isnan(latest["adx_14"]) else 0.0
+        di_plus = float(latest["di_plus"]) if "di_plus" in latest and not np.isnan(latest["di_plus"]) else 0.0
+        di_minus = float(latest["di_minus"]) if "di_minus" in latest and not np.isnan(latest["di_minus"]) else 0.0
+        chop = float(latest["chop_14"]) if "chop_14" in latest and not np.isnan(latest["chop_14"]) else 50.0
+        realized_vol = (
+            float(latest["realized_vol_20"])
+            if "realized_vol_20" in latest and not np.isnan(latest["realized_vol_20"])
+            else 0.0
+        )
+
+        # Choppiness / trend-strength gate: ADX below the trend threshold OR
+        # Choppiness above the chop ceiling means the tape is non-trending.
+        is_choppy = (
+            adx < settings.ADX_TREND_THRESHOLD
+        ) or (
+            chop > settings.CHOP_MAX_THRESHOLD
+        )
 
         # Market Regime
         if close > ema_200 and ema_20 > ema_50:
@@ -114,4 +165,11 @@ class IndicatorEngine:
             "macd_hist": float(latest["macd_hist"]) if not np.isnan(latest["macd_hist"]) else 0.0,
             "prev_macd_hist": float(prev["macd_hist"]) if not np.isnan(prev["macd_hist"]) else 0.0,
             "regime": regime,
+            # New regime-quality features
+            "adx_14": adx,
+            "di_plus": di_plus,
+            "di_minus": di_minus,
+            "chop_14": chop,
+            "realized_vol_20": realized_vol,
+            "is_choppy": bool(is_choppy),
         }

@@ -15,6 +15,7 @@ from core.binance_client import BinanceSpotClient
 from strategy.indicators import IndicatorEngine
 from strategy.ai_agent import AIAgent, AIAssessment
 from risk.risk_manager import RiskManager
+from risk.portfolio_risk import PortfolioRiskEngine, KillSwitch
 from storage.database import Database, minutes_since as db_minutes_since
 
 logger = logging.getLogger("HalalBotEngine")
@@ -30,6 +31,81 @@ class BotEngine:
         self.db = database or Database()
         self.ai = ai_agent or AIAgent()
         self.is_paper = settings.PAPER_TRADING
+        self.kill_switch = KillSwitch()
+        # Per-cycle caches for the correlation guard (avoids redundant kline fetches)
+        self._corr_closes_cache: Dict[str, list] = {}
+
+    # ------------------------------------------------------------------
+    # Portfolio-level analytics (equity, drawdown, correlation inputs)
+    # ------------------------------------------------------------------
+    def get_total_equity(self) -> float:
+        """Cash balance plus mark-to-market value of every open position."""
+        cash = self.get_current_usdt_balance()
+        invested = 0.0
+        for pos in self.db.get_all_active_positions():
+            try:
+                px = self.client.get_ticker_price(pos["symbol"])
+            except Exception:
+                px = pos["entry_price"]
+            invested += float(pos["quantity"]) * float(px)
+        return cash + invested
+
+    def _returns_for_symbol(self, symbol: str) -> list:
+        """
+        Cached per-cycle realized-return series used by the correlation guard.
+        Fails soft (empty list) on any fetch error so a data hiccup never blocks
+        legitimate entries.
+        """
+        if symbol in self._corr_closes_cache:
+            return self._corr_closes_cache[symbol]
+        try:
+            df = self.client.get_klines(
+                symbol=symbol,
+                interval=settings.CANDLE_TIMEFRAME,
+                limit=settings.CORRELATION_LOOKBACK_CANDLES + 5
+            )
+            closes = [float(c) for c in df["close"].tolist()]
+            rets = PortfolioRiskEngine.returns_from_closes(closes)
+        except Exception:
+            rets = []
+        self._corr_closes_cache[symbol] = rets
+        return rets
+
+    def evaluate_portfolio_guards(self) -> Dict[str, Any]:
+        """
+        Compute the portfolio drawdown state once per cycle: the size multiplier
+        from the circuit breaker, whether the kill switch is (now) tripped, and
+        the current total-exposure / heat levels.
+        """
+        equity_series = self.db.get_equity_series()
+        equity = self.get_total_equity()
+        # Include today's live equity point so a fresh intraday loss is counted.
+        if not equity_series or abs(equity_series[-1] - equity) > 1e-9:
+            equity_series = equity_series + [equity]
+
+        dd_pct, hwm = PortfolioRiskEngine.compute_drawdown(equity_series)
+        mult, dd_reason = PortfolioRiskEngine.drawdown_size_multiplier(dd_pct)
+
+        halted = self.kill_switch.is_halted()
+        if mult <= 0.0 and not halted:
+            self.kill_switch.trip(dd_reason)
+            halted = True
+            logger.warning(f"KILL SWITCH TRIPPED: {dd_reason}")
+
+        if halted:
+            mult = 0.0
+
+        positions = self.db.get_all_active_positions()
+        return {
+            "equity": round(equity, 2),
+            "high_water_mark": round(hwm, 2),
+            "drawdown_pct": round(dd_pct, 2),
+            "size_multiplier": mult,
+            "reason": dd_reason,
+            "halted": halted,
+            "total_exposure_pct": PortfolioRiskEngine.total_exposure_pct(positions, equity),
+            "portfolio_heat_pct": PortfolioRiskEngine.portfolio_heat_pct(positions, equity),
+        }
 
     def get_current_usdt_balance(self) -> float:
         """Fetch current available USDT balance (Simulated paper balance or live Binance Spot)."""
@@ -47,6 +123,7 @@ class BotEngine:
         Execute one full cycle of market scanning, position management, and trade execution.
         """
         cycle_start = datetime.now(timezone.utc)
+        self._corr_closes_cache = {}
         results: Dict[str, Any] = {
             "timestamp": cycle_start.isoformat(),
             "is_paper": self.is_paper,
@@ -56,6 +133,17 @@ class BotEngine:
             "actions_taken": [],
             "errors": []
         }
+
+        # Portfolio-level risk state (drawdown breaker / kill switch / exposure)
+        try:
+            guards = self.evaluate_portfolio_guards()
+            results["portfolio_guards"] = guards
+        except Exception as e:
+            guards = {"size_multiplier": 1.0, "halted": False, "drawdown_pct": 0.0,
+                      "total_exposure_pct": 0.0, "portfolio_heat_pct": 0.0,
+                      "reason": f"guards unavailable: {e}"}
+            results["portfolio_guards"] = guards
+            results["errors"].append(f"Portfolio guard evaluation failed: {e}")
 
         # -------------------------------------------------------------
         # STEP 1: Manage Open Positions (Exits, Stop-Loss, Take-Profit)
@@ -110,8 +198,18 @@ class BotEngine:
                     current_price=curr_price,
                     stop_loss=sl,
                     take_profit=tp,
-                    highest_price_seen=highest_price
+                    highest_price_seen=highest_price,
+                    entry_time=pos.get("entry_time")
                 )
+
+                # Time-based exit: recycle capital stuck in a dead trade.
+                # Skipped if a hard SL/TP already fired, and only fires when a
+                # MAX_HOLD_HOURS horizon is configured (0 = disabled).
+                if not should_exit and not settings.STRICT_SL_TP_EXIT_ONLY:
+                    ts_hit, ts_reason = RiskManager.time_stop_hit(pos.get("entry_time"))
+                    if ts_hit:
+                        should_exit = True
+                        exit_reason = ts_reason
 
                 # If no technical exit hit, check if market regime collapsed via AI.
                 # STRICT_SL_TP_EXIT_ONLY: AI can never trigger a sale — the pre-committed
@@ -168,6 +266,17 @@ class BotEngine:
         available_usdt = self.get_current_usdt_balance()
         open_count = len(self.db.get_all_active_positions())
         for pending in self.db.get_pending_entries():
+            # A pending order is stale risk, not an entitlement to bypass newly
+            # tripped portfolio limits. Leave it waiting unless the kill switch
+            # is active; on halt cancel it so it cannot fill after restart.
+            if guards.get("halted"):
+                self.db.update_pending_entry_status(pending["id"], "CANCELLED")
+                logger.warning(f"Cancelled pending {pending['symbol']} due to active kill switch")
+                continue
+            if guards.get("total_exposure_pct", 0.0) >= settings.MAX_TOTAL_EXPOSURE_PERCENT:
+                continue
+            if guards.get("portfolio_heat_pct", 0.0) >= settings.MAX_PORTFOLIO_HEAT_PERCENT:
+                continue
             fill = self._process_pending_entry(pending, available_usdt, open_count)
             if fill:
                 results["actions_taken"].append(fill)
@@ -187,6 +296,24 @@ class BotEngine:
             logger.info(
                 f"Max open positions ({settings.MAX_OPEN_POSITIONS}) reached; skipping entry scan"
             )
+
+        # Portfolio-level gates: kill switch / total exposure / portfolio heat
+        if guards.get("halted"):
+            logger.warning(f"Entry scan skipped: kill switch active ({guards['reason']})")
+            results["errors"].append(f"Entries halted by kill switch: {guards['reason']}")
+            max_new = 0
+        elif guards.get("total_exposure_pct", 0.0) >= settings.MAX_TOTAL_EXPOSURE_PERCENT:
+            logger.info(
+                f"Entry scan skipped: total exposure {guards['total_exposure_pct']}% >= "
+                f"cap {settings.MAX_TOTAL_EXPOSURE_PERCENT}%"
+            )
+            max_new = 0
+        elif guards.get("portfolio_heat_pct", 0.0) >= settings.MAX_PORTFOLIO_HEAT_PERCENT:
+            logger.info(
+                f"Entry scan skipped: portfolio heat {guards['portfolio_heat_pct']}% >= "
+                f"cap {settings.MAX_PORTFOLIO_HEAT_PERCENT}%"
+            )
+            max_new = 0
 
         for symbol in settings.TRADING_PAIRS:
             if max_new <= 0:
@@ -262,8 +389,16 @@ class BotEngine:
                     # Pending-entry mode: compute a target entry zone below market and
                     # queue the trade instead of chasing the current price.
                     if settings.PENDING_ENTRY_ENABLED:
-                        if self.db.get_pending_entry_for_symbol(symbol):
-                            continue  # one pending order per symbol
+                        existing_pending = self.db.get_pending_entry_for_symbol(symbol)
+                        if existing_pending:
+                            # One pending order per symbol — but the AI may amend it
+                            # on fresh analysis (direction-safe rules inside).
+                            amended = self._maybe_amend_pending_entry(
+                                existing_pending, snapshot, assessment
+                            )
+                            if amended:
+                                results["actions_taken"].append(amended)
+                            continue
                         queued = self._queue_pending_entry(
                             symbol=symbol,
                             snapshot=snapshot,
@@ -278,8 +413,22 @@ class BotEngine:
                         available_usdt=available_usdt,
                         current_price=snapshot["close"],
                         stop_loss_price=assessment.recommended_stop_loss,
-                        symbol=symbol
+                        symbol=symbol,
+                        confidence=assessment.confidence,
+                        realized_vol_per_bar=snapshot.get("realized_vol_20"),
+                        drawdown_multiplier=guards.get("size_multiplier", 1.0)
                     )
+
+                    # Portfolio concentration gate: block the entry if it would
+                    # push capital already held in correlated assets past the cap.
+                    if size_res.is_valid:
+                        corr_ok, corr_reason = self._correlation_gate_ok(
+                            symbol, size_res.notional_value_usdt, guards.get("equity", 0.0)
+                        )
+                        if not corr_ok:
+                            logger.info(f"Entry for {symbol} blocked by correlation guard: {corr_reason}")
+                            results["errors"].append(f"{symbol}: correlation guard — {corr_reason}")
+                            continue
 
                     if size_res.is_valid:
                         action_summary = self._execute_buy(
@@ -312,20 +461,75 @@ class BotEngine:
             return IndicatorEngine.confirmed_candles(df)
         return df
 
-    def _queue_pending_entry(self, symbol: str, snapshot: dict, assessment) -> Optional[Dict[str, Any]]:
+    def _realized_vol_for(self, symbol: str) -> Optional[float]:
         """
-        Compute the AI's target entry zone and queue a pending order.
+        Latest per-bar realized vol for a symbol (indicators must be warmed up).
+        Used by volatility-targeted sizing. Returns None on any failure so sizing
+        falls back to the plain fixed-fractional budget.
+        """
+        try:
+            df = self.client.get_klines(
+                symbol=symbol, interval=settings.CANDLE_TIMEFRAME,
+                limit=settings.CANDLE_LIMIT
+            )
+            df = self._signal_frame(df)
+            calc = IndicatorEngine.calculate_all(df)
+            snap = IndicatorEngine.get_latest_snapshot(calc)
+            vol = snap.get("realized_vol_20") or None
+            return vol if vol and vol > 0 else None
+        except Exception:
+            return None
+
+    def _drawdown_multiplier(self) -> float:
+        """Current circuit-breaker size multiplier (always 0..1)."""
+        try:
+            return float(self.evaluate_portfolio_guards().get("size_multiplier", 1.0))
+        except Exception:
+            return 1.0
+
+    def _correlation_gate_ok(self, symbol: str, notional: float, equity: float) -> tuple:
+        """
+        Ensure adding `notional` of `symbol` keeps capital in correlated assets
+        under MAX_CORRELATED_EXPOSURE_PERCENT of equity. Fails OPEN on missing data.
+        """
+        try:
+            open_positions = self.db.get_all_active_positions()
+            if not open_positions or equity <= 0:
+                return True, ""
+            cand_returns = self._returns_for_symbol(symbol)
+            position_returns = {
+                p["symbol"]: self._returns_for_symbol(p["symbol"]) for p in open_positions
+            }
+            corr_pct, mates = PortfolioRiskEngine.correlated_exposure_pct(
+                candidate_symbol=symbol,
+                candidate_returns=cand_returns,
+                open_positions=open_positions,
+                position_returns=position_returns,
+                equity=equity,
+            )
+            projected_pct = corr_pct + (notional / equity * 100.0)
+            if projected_pct > settings.MAX_CORRELATED_EXPOSURE_PERCENT:
+                return False, (
+                    f"correlated exposure would reach {projected_pct:.1f}% "
+                    f"(cap {settings.MAX_CORRELATED_EXPOSURE_PERCENT}%) with {mates}"
+                )
+            return True, ""
+        except Exception as e:
+            logger.warning(f"Correlation gate unavailable for {symbol} (fail-open): {e}")
+            return True, ""
+
+    def _compute_entry_zone(self, snapshot: dict, assessment) -> Optional[tuple]:
+        """
+        Compute the AI's target entry zone and zone-adjusted SL/TP.
         Zone = min(EMA20, close - PULLBACK_ATR * ATR), i.e. buy the pullback
         toward dynamic support instead of chasing the current close.
-        Returns the queued action summary, or None if price is already inside
-        the zone (caller should then buy immediately at market).
+        Returns (zone, sl, tp) or None if the zone is already at market.
         """
         close = snapshot["close"]
         atr = snapshot.get("atr_14") or close * 0.01
         ema20 = snapshot.get("ema_20") or close
 
         zone = min(ema20, close - settings.PENDING_ENTRY_PULLBACK_ATR * atr)
-        # If the zone is at/above market, price is already there — buy now.
         if zone >= close * 0.999:
             return None
 
@@ -334,6 +538,19 @@ class BotEngine:
         delta = close - zone
         sl = assessment.recommended_stop_loss - delta
         tp = assessment.recommended_take_profit - delta
+        return zone, sl, tp
+
+    def _queue_pending_entry(self, symbol: str, snapshot: dict, assessment) -> Optional[Dict[str, Any]]:
+        """
+        Queue a pending order at the AI's target entry zone.
+        Returns the queued action summary, or None if price is already inside
+        the zone (caller should then buy immediately at market).
+        """
+        close = snapshot["close"]
+        computed = self._compute_entry_zone(snapshot, assessment)
+        if not computed:
+            return None
+        zone, sl, tp = computed
 
         valid, reason = self._validate_stops(zone, sl, tp)
         if not valid:
@@ -361,6 +578,84 @@ class BotEngine:
             "market_price": close,
             "stop_loss": sl,
             "take_profit": tp,
+            "confidence": assessment.confidence
+        }
+
+    def _maybe_amend_pending_entry(self, pending: dict, snapshot: dict, assessment) -> Optional[Dict[str, Any]]:
+        """
+        Re-evaluate a waiting pending order against fresh AI analysis and amend
+        its zone if warranted. Direction-safe guardrails:
+          - The fresh analysis must independently re-qualify (caller already
+            enforced BUY + confidence >= threshold + valid stops).
+          - Downward zone moves (better price) are always allowed.
+          - Upward zone moves are allowed ONLY if the new stop is not looser
+            than the old stop (risk never widens just to chase price).
+          - Moves smaller than 0.25x ATR are ignored (anti-churn).
+          - A single order may be amended at most PENDING_ENTRY_MAX_AMENDMENTS
+            times, then it is left to fill or expire.
+        Every amendment extends the expiry window and is audit-logged in the DB.
+        Returns an action summary if amended, else None.
+        """
+        if not settings.PENDING_ENTRY_AMEND_ENABLED:
+            return None
+        if pending.get("amend_count", 0) >= settings.PENDING_ENTRY_MAX_AMENDMENTS:
+            return None
+
+        close = snapshot["close"]
+        atr = snapshot.get("atr_14") or close * 0.01
+
+        computed = self._compute_entry_zone(snapshot, assessment)
+        if not computed:
+            return None
+        new_zone, new_sl, new_tp = computed
+
+        old_zone = pending["target_entry"]
+        old_sl = pending["stop_loss"]
+
+        # Anti-churn: ignore tiny adjustments
+        if abs(new_zone - old_zone) < 0.25 * atr:
+            return None
+
+        moving_up = new_zone > old_zone
+        if moving_up and new_sl < old_sl:
+            logger.info(
+                f"Amendment rejected for {pending['symbol']}: zone up "
+                f"({old_zone:.4f} -> {new_zone:.4f}) would loosen stop "
+                f"({old_sl:.4f} -> {new_sl:.4f})"
+            )
+            return None
+
+        valid, reason = self._validate_stops(new_zone, new_sl, new_tp)
+        if not valid:
+            return None
+
+        direction = "lowered" if not moving_up else "raised (stop tightened)"
+        note = (
+            f"zone {direction}; conviction {assessment.confidence:.2f}; "
+            f"{assessment.rationale[:120]}"
+        )
+        expires = datetime.now(timezone.utc) + timedelta(hours=settings.PENDING_ENTRY_EXPIRY_HOURS)
+        self.db.amend_pending_entry(
+            entry_id=pending["id"],
+            target_entry=new_zone,
+            stop_loss=new_sl,
+            take_profit=new_tp,
+            confidence=assessment.confidence,
+            rationale=assessment.rationale,
+            expires_at=expires.isoformat(),
+            note=note
+        )
+        logger.info(
+            f"Amended pending entry {pending['symbol']} #{pending['id']}: "
+            f"zone {old_zone:.4f} -> {new_zone:.4f}, SL {old_sl:.4f} -> {new_sl:.4f}"
+        )
+        return {
+            "type": "PENDING_ENTRY_AMENDED",
+            "symbol": pending["symbol"],
+            "old_target_entry": old_zone,
+            "target_entry": new_zone,
+            "stop_loss": new_sl,
+            "take_profit": new_tp,
             "confidence": assessment.confidence
         }
 
@@ -418,7 +713,10 @@ class BotEngine:
             available_usdt=available_usdt,
             current_price=price,
             stop_loss_price=pending["stop_loss"],
-            symbol=symbol
+            symbol=symbol,
+            confidence=float(pending.get("confidence", 1.0)),
+            realized_vol_per_bar=self._realized_vol_for(symbol),
+            drawdown_multiplier=self._drawdown_multiplier()
         )
         if not size_res.is_valid:
             self.db.update_pending_entry_status(pending["id"], "CANCELLED")
